@@ -121,6 +121,11 @@ function environment_initialization() {
         echo "  * ${COLOR_BLUE}Airflow backend:${COLOR_RESET} MySQL: ${MYSQL_VERSION}"
     elif [[ ${BACKEND=} == "sqlite" ]]; then
         echo "  * ${COLOR_BLUE}Airflow backend:${COLOR_RESET} Sqlite"
+    elif [[ ${BACKEND=} == "custom" ]]; then
+        local _conn_url="${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN:-}"
+        local _masked_url
+        _masked_url=$(echo "${_conn_url}" | sed -E 's|://([^:]+):([^@]+)@|://\1:***@|')
+        echo "  * ${COLOR_BLUE}Airflow backend:${COLOR_RESET} Custom (${_masked_url})"
     fi
     echo
 
@@ -129,6 +134,13 @@ function environment_initialization() {
         echo "${COLOR_BLUE}Forcing scheduler/standalone_dag_processor to True${COLOR_RESET}"
         echo
         export AIRFLOW__SCHEDULER__STANDALONE_DAG_PROCESSOR=True
+    fi
+
+    if [[ ${GO_WORKER=} == "true" ]]; then
+        echo
+        echo "${COLOR_BLUE}Starting go worker${COLOR_RESET}"
+        echo
+        export AIRFLOW__SCHEDULER__GO_WORKER=True
     fi
 
     RUN_TESTS=${RUN_TESTS:="false"}
@@ -218,8 +230,10 @@ function environment_initialization() {
             export AIRFLOW__CELERY__POOL=${AIRFLOW__CELERY__POOL:-solo}
         fi
         export AIRFLOW__CORE__LOAD_EXAMPLES=${LOAD_EXAMPLES}
-        wait_for_asset_compilation
-        if [[ ${USE_MPROCS:="false"} == "true" || ${USE_MPROCS} == "True" ]]; then
+        if [[ ${SKIP_ASSETS_COMPILATION:="false"} == "false" ]]; then
+            wait_for_asset_compilation
+        fi
+        if [[ ${TERMINAL_MULTIPLEXER:="mprocs"} == "mprocs" ]]; then
             # shellcheck source=scripts/in_container/bin/run_mprocs
             exec run_mprocs
         else
@@ -268,12 +282,14 @@ function determine_airflow_to_use() {
         echo
         echo "${COLOR_BLUE}Reinstalling all development dependencies${COLOR_RESET}"
         echo
-        # Use uv run to install necessary dependencies automatically
-        # in the future we will be able to use uv sync when `uv.lock` is supported
-        # for the use in parallel runs in docker containers--no-cache is needed - otherwise there is
-        # possibility of overriding temporary environments by multiple parallel processes
+        # Generate constraints from uv.lock and use them to install development dependencies
+        # via the Python script. --no-cache is needed - otherwise there is possibility of
+        # overriding temporary environments by multiple parallel processes
+        local constraint_file="/tmp/constraints-from-lock.txt"
+        uv export --frozen --no-hashes --no-emit-project --no-emit-workspace --no-editable --no-header \
+            --no-annotate > "${constraint_file}" 2>/dev/null || true
         uv run --no-cache /opt/airflow/scripts/in_container/install_development_dependencies.py \
-           --constraint https://raw.githubusercontent.com/apache/airflow/constraints-main/constraints-"${PYTHON_MAJOR_MINOR_VERSION}".txt
+           --constraint "${constraint_file}"
         # Some packages might leave legacy typing module which causes test issues
         # shellcheck disable=SC2086
         ${PACKAGING_TOOL_CMD} uninstall ${EXTRA_UNINSTALL_FLAGS} typing || true
@@ -376,6 +392,57 @@ function check_run_tests() {
     fi
 }
 
+function reinstall_shared_distributions() {
+    # The shared distributions under shared/<name>/ are workspace members that are not
+    # transitively required by airflow-core or any provider, so the lowest-direct
+    # `uv sync` above wipes them out from the environment. Re-install them with
+    # --no-deps so that the `airflow_shared.*` namespace used by devel-common test
+    # utils resolves at test collection time without disturbing the lowest-direct
+    # resolution that was just applied.
+    echo
+    echo "${COLOR_BLUE}Re-installing shared distributions (airflow_shared.*) after uv sync${COLOR_RESET}"
+    echo
+    # shellcheck disable=SC2046
+    uv pip install --no-deps $(ls -d /opt/airflow/shared/*/)
+}
+
+# Providers whose `uv sync --all-extras` (run below by check_force_lowest_dependencies)
+# needs additional native build prerequisites installed at test time rather than baked
+# into the base CI image. Each listed provider must ship a declarative manifest at
+# providers/<id>/pre_extras_install.yaml; the manifest is interpreted by
+# scripts/in_container/run_pre_extras_install.py, which restricts allowed operations
+# to pinned-checksum downloads, archive extraction under /opt or /tmp, and env-var
+# export. Providers cannot run arbitrary code through this hook. Maintainers should
+# review every addition to this list as a privileged change. See
+# contributing-docs/12_provider_distributions.rst.
+PROVIDERS_NEEDING_PRE_EXTRAS_INSTALL=()
+
+function run_pre_extras_install_if_registered() {
+    local provider_id="${1}"
+    local registered_provider
+    for registered_provider in "${PROVIDERS_NEEDING_PRE_EXTRAS_INSTALL[@]}"; do
+        if [[ "${registered_provider}" == "${provider_id}" ]]; then
+            echo
+            echo "${COLOR_BLUE}Running pre-extras install manifest for ${provider_id}${COLOR_RESET}"
+            echo
+            local env_file
+            env_file=$(mktemp)
+            if ! python "${AIRFLOW_SOURCES}/scripts/in_container/run_pre_extras_install.py" \
+                    "${provider_id}" --emit-env-to "${env_file}"; then
+                rm -f "${env_file}"
+                echo "${COLOR_RED}Pre-extras install failed for ${provider_id}${COLOR_RESET}"
+                exit 1
+            fi
+            if [[ -s "${env_file}" ]]; then
+                # shellcheck disable=SC1090
+                source "${env_file}"
+            fi
+            rm -f "${env_file}"
+            return
+        fi
+    done
+}
+
 function check_force_lowest_dependencies() {
     if [[ ${FORCE_LOWEST_DEPENDENCIES=} != "true" ]]; then
         return
@@ -394,11 +461,30 @@ function check_force_lowest_dependencies() {
             exit 0
         fi
         cd "${AIRFLOW_SOURCES}/providers/${provider_id/.//}" || exit 1
+        run_pre_extras_install_if_registered "${provider_id}"
         # --no-binary  is needed in order to avoid libxml and xmlsec using different version of libxml2
         # (binary lxml embeds its own libxml2, while xmlsec uses system one).
         # See https://bugs.launchpad.net/lxml/+bug/2110068
-        uv sync --resolution lowest-direct --no-binary-package lxml --no-binary-package xmlsec --all-extras \
-            --no-python-downloads --no-managed-python
+
+        local sync_successful="false"
+        for attempt in 1 2 3; do
+            echo "Attempt ${attempt} of syncing to lowest dependencies"
+            set -x
+            if UV_LOCK_TIMEOUT=200 uv sync --resolution lowest-direct --no-binary-package lxml --no-binary-package xmlsec --all-extras \
+                --no-python-downloads --no-managed-python; then
+                set +x
+                sync_successful="true"
+                break
+            fi
+            set +x
+            echo "Sleeping 30s"
+            sleep 30
+            echo "Attempt ${attempt} failed. Retrying..."
+        done
+        if [[ "${sync_successful}" != "true" ]]; then
+            echo "${COLOR_RED}Failed to sync lowest dependencies after 3 attempts.${COLOR_RESET}"
+            exit 1
+        fi
     else
         echo
         echo "${COLOR_BLUE}Forcing dependencies to lowest versions for Airflow.${COLOR_RESET}"
@@ -410,6 +496,7 @@ function check_force_lowest_dependencies() {
         uv sync --resolution lowest-direct --no-binary-package lxml --no-binary-package xmlsec --all-extras \
             --no-python-downloads --no-managed-python
     fi
+    reinstall_shared_distributions
 }
 
 function check_airflow_python_client_installation() {

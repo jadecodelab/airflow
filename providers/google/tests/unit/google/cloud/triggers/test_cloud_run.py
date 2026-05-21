@@ -20,11 +20,25 @@ from __future__ import annotations
 from unittest import mock
 
 import pytest
+from google.cloud.run_v2 import Execution
 from google.protobuf.any_pb2 import Any
 from google.rpc.status_pb2 import Status
 
 from airflow.providers.google.cloud.triggers.cloud_run import CloudRunJobFinishedTrigger, RunJobStatus
 from airflow.triggers.base import TriggerEvent
+
+
+def _packed_execution_response(task_count, succeeded_count, failed_count, cancelled_count=0):
+    """Build a ``google.protobuf.Any`` packed with an ``Execution`` proto for trigger tests."""
+    execution = Execution()
+    execution.task_count = task_count
+    execution.succeeded_count = succeeded_count
+    execution.failed_count = failed_count
+    execution.cancelled_count = cancelled_count
+    response = Any()
+    response.Pack(Execution.pb(execution))
+    return response
+
 
 OPERATION_NAME = "operation"
 JOB_NAME = "jobName"
@@ -36,6 +50,7 @@ GCP_CONNECTION_ID = "gcp_connection_id"
 POLL_SLEEP = 0.01
 TIMEOUT = 0.02
 IMPERSONATION_CHAIN = "impersonation_chain"
+USE_REGIONAL_ENDPOINT = True
 
 
 @pytest.fixture
@@ -45,10 +60,12 @@ def trigger():
         job_name=JOB_NAME,
         project_id=PROJECT_ID,
         location=LOCATION,
+        use_regional_endpoint=USE_REGIONAL_ENDPOINT,
         gcp_conn_id=GCP_CONNECTION_ID,
         polling_period_seconds=POLL_SLEEP,
         timeout=TIMEOUT,
         impersonation_chain=IMPERSONATION_CHAIN,
+        transport=None,
     )
 
 
@@ -64,7 +81,9 @@ class TestCloudBatchJobFinishedTrigger:
             "gcp_conn_id": GCP_CONNECTION_ID,
             "polling_period_seconds": POLL_SLEEP,
             "timeout": TIMEOUT,
+            "use_regional_endpoint": USE_REGIONAL_ENDPOINT,
             "impersonation_chain": IMPERSONATION_CHAIN,
+            "transport": None,
         }
 
     @pytest.mark.asyncio
@@ -76,12 +95,13 @@ class TestCloudBatchJobFinishedTrigger:
         Tests the CloudRunJobFinishedTrigger fires once the job execution reaches a successful state.
         """
 
-        async def _mock_operation(name):
+        async def _mock_operation(operation_name, location, use_regional_endpoint):
             operation = mock.MagicMock()
             operation.done = True
             operation.name = "name"
             operation.error = Any()
             operation.error.ParseFromString(b"")
+            operation.response = _packed_execution_response(task_count=3, succeeded_count=3, failed_count=0)
             return operation
 
         mock_hook.return_value.get_operation = _mock_operation
@@ -99,6 +119,59 @@ class TestCloudBatchJobFinishedTrigger:
 
     @pytest.mark.asyncio
     @mock.patch("airflow.providers.google.cloud.triggers.cloud_run.CloudRunAsyncHook")
+    async def test_trigger_yields_fail_when_job_cancelled(
+        self, mock_hook, trigger: CloudRunJobFinishedTrigger
+    ):
+        """
+        When the Cloud Run Job is cancelled via the Google Cloud UI/API the LRO completes with
+        no ``operation.error`` set but the Execution reports a non-zero ``cancelled_count``. The
+        trigger must surface this as a failure to mirror the sync path's semantics — see #57791.
+        """
+
+        async def _mock_operation(operation_name, location, use_regional_endpoint):
+            operation = mock.MagicMock()
+            operation.done = True
+            operation.error = Any()
+            operation.error.ParseFromString(b"")
+            operation.response = _packed_execution_response(
+                task_count=3, succeeded_count=1, failed_count=0, cancelled_count=2
+            )
+            return operation
+
+        mock_hook.return_value.get_operation = _mock_operation
+        generator = trigger.run()
+        actual = await generator.asend(None)  # type:ignore[attr-defined]
+        assert actual.payload["status"] == RunJobStatus.FAIL.value
+        assert actual.payload["job_name"] == JOB_NAME
+        assert "cancelled_count=2" in actual.payload["operation_error_message"]
+        assert "did not finish all tasks" in actual.payload["operation_error_message"]
+
+    @pytest.mark.asyncio
+    @mock.patch("airflow.providers.google.cloud.triggers.cloud_run.CloudRunAsyncHook")
+    async def test_trigger_yields_fail_when_some_tasks_failed(
+        self, mock_hook, trigger: CloudRunJobFinishedTrigger
+    ):
+        """
+        Regression-guard symmetry with the sync path: when ``failed_count > 0`` and the counts
+        sum to ``task_count`` the deferrable trigger must still report failure.
+        """
+
+        async def _mock_operation(operation_name, location, use_regional_endpoint):
+            operation = mock.MagicMock()
+            operation.done = True
+            operation.error = Any()
+            operation.error.ParseFromString(b"")
+            operation.response = _packed_execution_response(task_count=3, succeeded_count=1, failed_count=2)
+            return operation
+
+        mock_hook.return_value.get_operation = _mock_operation
+        generator = trigger.run()
+        actual = await generator.asend(None)  # type:ignore[attr-defined]
+        assert actual.payload["status"] == RunJobStatus.FAIL.value
+        assert "Some Cloud Run Job tasks failed" in actual.payload["operation_error_message"]
+
+    @pytest.mark.asyncio
+    @mock.patch("airflow.providers.google.cloud.triggers.cloud_run.CloudRunAsyncHook")
     async def test_trigger_on_operation_failed_yield_error(
         self, mock_hook, trigger: CloudRunJobFinishedTrigger
     ):
@@ -106,7 +179,7 @@ class TestCloudBatchJobFinishedTrigger:
         Tests the CloudRunJobFinishedTrigger raises an exception once the job execution fails.
         """
 
-        async def _mock_operation(name):
+        async def _mock_operation(operation_name, location, use_regional_endpoint):
             operation = mock.MagicMock()
             operation.done = True
             operation.name = "name"
@@ -136,7 +209,7 @@ class TestCloudBatchJobFinishedTrigger:
         Tests the CloudRunJobFinishedTrigger fires once the job execution times out with an error message.
         """
 
-        async def _mock_operation(name):
+        async def _mock_operation(operation_name, location, use_regional_endpoint):
             operation = mock.MagicMock()
             operation.done = False
             operation.error = mock.MagicMock()

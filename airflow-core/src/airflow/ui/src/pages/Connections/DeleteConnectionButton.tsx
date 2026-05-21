@@ -20,8 +20,7 @@ import { Button, Code, Flex, Heading, Text, useDisclosure, VStack } from "@chakr
 import { useTranslation } from "react-i18next";
 import { FiTrash2 } from "react-icons/fi";
 
-import { Dialog } from "src/components/ui";
-import ActionButton from "src/components/ui/ActionButton";
+import { Dialog, IconButton } from "src/components/ui";
 import { useDeleteConnection } from "src/queries/useDeleteConnection";
 
 type Props = {
@@ -38,19 +37,16 @@ const DeleteConnectionButton = ({ connectionId, disabled }: Props) => {
 
   return (
     <>
-      <ActionButton
-        actionName={translate("connections.delete.title")}
+      <IconButton
         colorPalette="danger"
         disabled={disabled}
-        icon={<FiTrash2 />}
-        onClick={() => {
-          onOpen();
-        }}
-        text={translate("connections.delete.title")}
-        withText={false}
-      />
+        label={translate("connections.delete.title")}
+        onClick={onOpen}
+      >
+        <FiTrash2 />
+      </IconButton>
 
-      <Dialog.Root onOpenChange={onClose} open={open} size="xl">
+      <Dialog.Root onOpenChange={onClose} open={open}>
         <Dialog.Content backdrop>
           <Dialog.Header>
             <VStack align="start" gap={4}>

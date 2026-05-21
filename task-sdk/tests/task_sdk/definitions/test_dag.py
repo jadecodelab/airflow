@@ -24,11 +24,14 @@ from typing import Any
 
 import pytest
 
-from airflow.sdk import Context, Label, TaskGroup
+from airflow.sdk import Context, Label, PartitionAtRuntime, TaskGroup
 from airflow.sdk.bases.operator import BaseOperator
+from airflow.sdk.bases.timetable import BaseTimetable
 from airflow.sdk.definitions.dag import DAG, dag as dag_decorator
 from airflow.sdk.definitions.param import DagParam, Param, ParamsDict
+from airflow.sdk.definitions.timetables import assets, events, interval, simple, trigger  # noqa: F401
 from airflow.sdk.exceptions import AirflowDagCycleException, DuplicateTaskIdFound, RemovedInAirflow4Warning
+from airflow.utils.types import DagRunType
 
 DEFAULT_DATE = datetime(2016, 1, 1, tzinfo=timezone.utc)
 
@@ -436,6 +439,17 @@ class TestDag:
         with pytest.raises(ValueError, match="ContinuousTimetable requires max_active_runs <= 1"):
             dag = DAG("continuous", start_date=DEFAULT_DATE, schedule="@continuous", max_active_runs=25)
 
+    def test_only_partition_at_runtime_has_partitioned_at_runtime_flag(self):
+        """Regression guard: across every BaseTimetable subclass, only PartitionAtRuntime sets partitioned_at_runtime=True."""
+
+        def all_subclasses(cls):
+            for sub in cls.__subclasses__():
+                yield sub
+                yield from all_subclasses(sub)
+
+        flagged = {c for c in all_subclasses(BaseTimetable) if c.partitioned_at_runtime}
+        assert flagged == {PartitionAtRuntime}
+
     def test_dag_add_task_checks_trigger_rule(self):
         # A non fail stop dag should allow any trigger rule
         from airflow.sdk import TriggerRule
@@ -534,6 +548,98 @@ def test__tags_length(tags: list[str], should_pass: bool):
 def test__tags_duplicates(input_tags: list[str], expected_result: set[str]):
     result = DAG("test-dag", tags=input_tags)
     assert result.tags == expected_result
+
+
+@pytest.mark.parametrize(
+    ("schedule", "input_val", "expected"),
+    [
+        pytest.param("@daily", None, None, id="none"),
+        pytest.param(
+            "@daily",
+            [DagRunType.SCHEDULED],
+            frozenset([DagRunType.SCHEDULED]),
+            id="list_single",
+        ),
+        pytest.param(
+            "@daily",
+            [DagRunType.SCHEDULED, DagRunType.MANUAL],
+            frozenset([DagRunType.SCHEDULED, DagRunType.MANUAL]),
+            id="list_multiple",
+        ),
+        pytest.param(
+            "@daily",
+            {DagRunType.SCHEDULED},
+            frozenset([DagRunType.SCHEDULED]),
+            id="set",
+        ),
+        pytest.param(
+            "@daily",
+            DagRunType.SCHEDULED,
+            frozenset([DagRunType.SCHEDULED]),
+            id="single_enum",
+        ),
+        pytest.param(
+            None,
+            DagRunType.MANUAL,
+            frozenset([DagRunType.MANUAL]),
+            id="no_schedule_single_enum",
+        ),
+        pytest.param(
+            None,
+            [DagRunType.MANUAL, DagRunType.BACKFILL_JOB],
+            frozenset([DagRunType.MANUAL, DagRunType.BACKFILL_JOB]),
+            id="no_schedule_allow_manual_and_backfill",
+        ),
+    ],
+)
+def test_allowed_run_types_converter(schedule, input_val, expected):
+    dag = DAG("test-allowed-types", schedule=schedule, allowed_run_types=input_val)
+    assert dag.allowed_run_types == expected
+
+
+@pytest.mark.parametrize(
+    ("schedule", "allowed_run_types", "match"),
+    [
+        pytest.param(
+            "@daily",
+            [DagRunType.MANUAL],
+            "allowed_run_types must include SCHEDULED",
+            id="scheduled_dag_missing_scheduled",
+        ),
+        pytest.param(
+            "@hourly",
+            [DagRunType.BACKFILL_JOB],
+            "allowed_run_types must include SCHEDULED",
+            id="hourly_dag_missing_scheduled",
+        ),
+        pytest.param(
+            None,
+            [DagRunType.SCHEDULED],
+            "allowed_run_types must include MANUAL",
+            id="no_schedule_missing_manual",
+        ),
+        pytest.param(
+            None,
+            DagRunType.BACKFILL_JOB,
+            "allowed_run_types must include MANUAL",
+            id="no_schedule_single_missing_manual",
+        ),
+    ],
+)
+def test_allowed_run_types_conflicting_schedule(schedule, allowed_run_types, match):
+    with pytest.raises(ValueError, match=match):
+        DAG("test-allowed-conflict", schedule=schedule, allowed_run_types=allowed_run_types)
+
+
+def test_allowed_run_types_asset_triggered_missing_with_asset_schedule():
+    from airflow.sdk.definitions.asset import Asset
+
+    with pytest.raises(ValueError, match="allowed_run_types must include ASSET_TRIGGERED"):
+        DAG(
+            "test-allowed-asset",
+            schedule=[Asset("test")],
+            allowed_run_types=[DagRunType.MANUAL],
+        )
 
 
 def test__tags_mutable():
@@ -848,3 +954,44 @@ class TestCycleTester:
                 op1 >> Label("label") >> op2
 
         assert not dag.check_cycle()
+
+
+class TestDagGetItem:
+    def test_getitem_returns_task(self):
+        dag = DAG("test_dag", schedule=None, start_date=DEFAULT_DATE)
+        with dag:
+            op = DoNothingOperator(task_id="my_task")
+        assert dag["my_task"] is op
+
+    def test_getitem_returns_task_group(self):
+        dag = DAG("test_dag", schedule=None, start_date=DEFAULT_DATE)
+        with dag:
+            with TaskGroup(group_id="section") as tg:
+                DoNothingOperator(task_id="t")
+        assert dag["section"] is tg
+
+    def test_getitem_nested_task_by_qualified_id(self):
+        dag = DAG("test_dag", schedule=None, start_date=DEFAULT_DATE)
+        with dag:
+            with TaskGroup(group_id="section"):
+                op = DoNothingOperator(task_id="t")
+        assert dag["section.t"] is op
+
+    def test_getitem_nested_task_via_chained_access(self):
+        dag = DAG("test_dag", schedule=None, start_date=DEFAULT_DATE)
+        with dag:
+            with TaskGroup(group_id="section"):
+                op = DoNothingOperator(task_id="t")
+        assert dag["section"]["t"] is op
+
+    def test_getitem_missing_raises_node_not_found(self):
+        from airflow.sdk.exceptions import NodeNotFound
+
+        dag = DAG("test_dag", schedule=None, start_date=DEFAULT_DATE)
+        with pytest.raises(NodeNotFound):
+            dag["nonexistent"]
+
+    def test_getitem_missing_is_key_error(self):
+        dag = DAG("test_dag", schedule=None, start_date=DEFAULT_DATE)
+        with pytest.raises(KeyError):
+            dag["nonexistent"]

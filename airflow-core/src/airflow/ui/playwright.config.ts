@@ -21,12 +21,25 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const testConfig = {
+  asset: {
+    name: process.env.TEST_ASSET_NAME ?? "s3://dag1/output_1.txt",
+  },
+  connection: {
+    baseUrl: process.env.AIRFLOW_UI_BASE_URL ?? "http://localhost:28080",
+  },
   credentials: {
     password: process.env.TEST_PASSWORD ?? "admin",
     username: process.env.TEST_USERNAME ?? "admin",
   },
   testDag: {
+    hitlId: process.env.TEST_HITL_DAG_ID ?? "example_hitl_operator",
     id: process.env.TEST_DAG_ID ?? "example_bash_operator",
+  },
+  testTask: {
+    id: process.env.TEST_TASK_ID ?? "runme_0",
+  },
+  xcomDag: {
+    id: process.env.TEST_XCOM_DAG_ID ?? "example_xcom",
   },
 };
 
@@ -37,11 +50,12 @@ export const AUTH_FILE = path.join(currentDirname, "playwright/.auth/user.json")
 
 export default defineConfig({
   expect: {
-    timeout: 5000,
+    timeout: 10_000,
   },
   forbidOnly: process.env.CI !== undefined && process.env.CI !== "",
   fullyParallel: true,
   globalSetup: "./tests/e2e/global-setup.ts",
+  globalTeardown: "./tests/e2e/global-teardown.ts",
   projects: [
     {
       name: "chromium",
@@ -93,14 +107,15 @@ export default defineConfig({
     process.env.CI !== undefined && process.env.CI !== "" ? ["github"] : ["list"],
   ],
 
-  retries: process.env.CI !== undefined && process.env.CI !== "" ? 2 : 0,
+  retries: process.env.CI !== undefined && process.env.CI !== "" ? 4 : 0,
 
   testDir: "./tests/e2e/specs",
 
-  timeout: 30_000,
+  timeout: 60_000,
   use: {
     actionTimeout: 10_000,
     baseURL: process.env.AIRFLOW_UI_BASE_URL ?? "http://localhost:28080",
+    locale: "en-US",
     screenshot: "only-on-failure",
     trace: "on-first-retry",
     video: "retain-on-failure",

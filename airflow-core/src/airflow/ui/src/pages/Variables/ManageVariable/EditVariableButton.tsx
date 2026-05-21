@@ -21,8 +21,7 @@ import { useTranslation } from "react-i18next";
 import { FiEdit } from "react-icons/fi";
 
 import type { VariableResponse } from "openapi/requests/types.gen";
-import { Dialog } from "src/components/ui";
-import ActionButton from "src/components/ui/ActionButton";
+import { IconButton, Dialog } from "src/components/ui";
 import { useEditVariable } from "src/queries/useEditVariable";
 
 import type { VariableBody } from "./VariableForm";
@@ -50,6 +49,7 @@ const EditVariableButton = ({ disabled, variable }: Props) => {
   const initialVariableValue: VariableBody = {
     description: variable.description ?? "",
     key: variable.key,
+    team_name: variable.team_name ?? "",
     value: formatValue(variable.value),
   };
   const { editVariable, error, isPending, setError } = useEditVariable(initialVariableValue, {
@@ -63,18 +63,11 @@ const EditVariableButton = ({ disabled, variable }: Props) => {
 
   return (
     <>
-      <ActionButton
-        actionName={translate("variables.edit")}
-        disabled={disabled}
-        icon={<FiEdit />}
-        onClick={() => {
-          onOpen();
-        }}
-        text={translate("variables.edit")}
-        withText={false}
-      />
+      <IconButton disabled={disabled} label={translate("variables.edit")} onClick={onOpen}>
+        <FiEdit />
+      </IconButton>
 
-      <Dialog.Root onOpenChange={handleClose} open={open} size="xl">
+      <Dialog.Root onOpenChange={handleClose} open={open}>
         <Dialog.Content backdrop>
           <Dialog.Header>
             <Heading size="xl">{translate("variables.edit")}</Heading>

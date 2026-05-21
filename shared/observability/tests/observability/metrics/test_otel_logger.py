@@ -17,12 +17,17 @@
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
+import sys
 import time
 from unittest import mock
 
 import pytest
 from opentelemetry.metrics import MeterProvider
+from opentelemetry.sdk.metrics.view import ExponentialBucketHistogramAggregation, View
 
+from airflow_shared.observability.common import get_otel_data_exporter
 from airflow_shared.observability.exceptions import InvalidStatsNameException
 from airflow_shared.observability.metrics.otel_logger import (
     OTEL_NAME_MAX_LENGTH,
@@ -32,11 +37,15 @@ from airflow_shared.observability.metrics.otel_logger import (
     _generate_key_name,
     _is_up_down_counter,
     full_name,
+    get_otel_logger,
 )
 from airflow_shared.observability.metrics.validators import (
     BACK_COMPAT_METRIC_NAMES,
     MetricNameLengthExemptionWarning,
 )
+from airflow_shared.observability.otel_env_config import load_metrics_env_config
+
+from tests_common.test_utils.config import env_vars
 
 INVALID_STAT_NAME_CASES = [
     (None, "can not be None"),
@@ -181,7 +190,7 @@ class TestOtelMetrics:
         assert mock_random.call_count == 2
         # add() is called once in the initial stats.incr and once for the decr that passed the rate check.
         self.map[full_name(name)].add.assert_has_calls(expected_calls)
-        self.map[full_name(name)].add.call_count == 2
+        assert self.map[full_name(name)].add.call_count == 2
 
     def test_gauge_new_metric(self, name):
         self.stats.gauge(name, value=1)
@@ -196,7 +205,7 @@ class TestOtelMetrics:
         self.stats.gauge(name, value=1, tags=tags)
 
         self.meter.get_meter().create_gauge.assert_called_once_with(name=full_name(name))
-        self.map[key].attributes == tags
+        assert self.map[key].attributes == tags
 
     def test_gauge_existing_metric(self, name):
         self.stats.gauge(name, value=1)
@@ -236,25 +245,28 @@ class TestOtelMetrics:
 
         self.stats.timing(name, dt=datetime.timedelta(seconds=123))
 
-        self.meter.get_meter().create_gauge.assert_called_once_with(name=full_name(name))
-        expected_value = 123000.0
-        assert self.map[full_name(name)].value == expected_value
+        self.meter.get_meter().create_histogram.assert_called_once_with(name=full_name(name), unit="ms")
+        self.meter.get_meter().create_histogram.return_value.record.assert_called_once_with(
+            123000.0, attributes=None
+        )
 
     def test_timing_new_metric_with_tags(self, name):
         tags = {"hello": "world"}
-        key = _generate_key_name(full_name(name), tags)
 
         self.stats.timing(name, dt=1, tags=tags)
 
-        self.meter.get_meter().create_gauge.assert_called_once_with(name=full_name(name))
-        self.map[key].attributes == tags
+        self.meter.get_meter().create_histogram.assert_called_once_with(name=full_name(name), unit="ms")
+        self.meter.get_meter().create_histogram.return_value.record.assert_called_once_with(
+            1.0, attributes=tags
+        )
 
     def test_timing_existing_metric(self, name):
         self.stats.timing(name, dt=1)
         self.stats.timing(name, dt=2)
 
-        self.meter.get_meter().create_gauge.assert_called_once_with(name=full_name(name))
-        assert self.map[full_name(name)].value == 2
+        # histogram created only once, but both observations are recorded
+        self.meter.get_meter().create_histogram.assert_called_once_with(name=full_name(name), unit="ms")
+        assert self.meter.get_meter().create_histogram.return_value.record.call_count == 2
 
     # For the four test_timer_foo tests below:
     #   time.perf_count() is called once to get the starting timestamp and again
@@ -269,18 +281,19 @@ class TestOtelMetrics:
         expected_duration = 3140.0
         assert timer.duration == expected_duration
         assert mock_time.call_count == 2
-        self.meter.get_meter().create_gauge.assert_called_once_with(name=full_name(name))
+        self.meter.get_meter().create_histogram.assert_called_once_with(name=full_name(name), unit="ms")
 
     @mock.patch.object(time, "perf_counter", side_effect=[0.0, 3.14])
     def test_timer_no_name_returns_float_but_does_not_store_value(self, mock_time, name):
         with self.stats.timer() as timer:
             pass
 
+        assert hasattr(timer, "duration")
         assert isinstance(timer.duration, float)
         expected_duration = 3140.0
         assert timer.duration == expected_duration
         assert mock_time.call_count == 2
-        self.meter.get_meter().create_gauge.assert_not_called()
+        self.meter.get_meter().create_histogram.assert_not_called()
 
     @mock.patch.object(time, "perf_counter", side_effect=[0.0, 3.14])
     def test_timer_start_and_stop_manually_send_false(self, mock_time, name):
@@ -293,7 +306,7 @@ class TestOtelMetrics:
         expected_value = 3140.0
         assert timer.duration == expected_value
         assert mock_time.call_count == 2
-        self.meter.get_meter().create_gauge.assert_not_called()
+        self.meter.get_meter().create_histogram.assert_not_called()
 
     @mock.patch.object(time, "perf_counter", side_effect=[0.0, 3.14])
     def test_timer_start_and_stop_manually_send_true(self, mock_time, name):
@@ -306,4 +319,225 @@ class TestOtelMetrics:
         expected_value = 3140.0
         assert timer.duration == expected_value
         assert mock_time.call_count == 2
-        self.meter.get_meter().create_gauge.assert_called_once_with(name=full_name(name))
+        self.meter.get_meter().create_histogram.assert_called_once_with(name=full_name(name), unit="ms")
+
+    @pytest.mark.parametrize(
+        (
+            "provided_env_vars",
+            "airflow_conf_host",
+            "airflow_conf_port",
+            "expected_endpoint",
+            "expected_exporter_module",
+        ),
+        [
+            pytest.param(
+                {
+                    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:1234",
+                    "OTEL_EXPORTER_OTLP_PROTOCOL": "grpc",
+                },
+                "breeze-otel-collector",
+                "4318",
+                "localhost:1234",
+                "grpc",
+                id="env_vars_with_grpc",
+            ),
+            pytest.param(
+                {
+                    "OTEL_EXPORTER_OTLP_PROTOCOL": "grpc",
+                },
+                "breeze-otel-collector",
+                "4318",
+                "http://breeze-otel-collector:4318/v1/metrics",
+                "http",
+                id="protocol_is_ignored_if_no_env_endpoint",
+            ),
+            pytest.param(
+                {
+                    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:1234",
+                    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+                },
+                "breeze-otel-collector",
+                "4318",
+                "http://localhost:1234/v1/metrics",
+                "http",
+                id="for_http_with_env_vars_otel_builds_full_url",
+            ),
+            pytest.param(
+                {},
+                "breeze-otel-collector",
+                "4318",
+                "http://breeze-otel-collector:4318/v1/metrics",
+                "http",
+                id="use_airflow_config",
+            ),
+            pytest.param(
+                {
+                    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:1234",
+                    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+                },
+                None,
+                None,
+                "http://localhost:1234/v1/metrics",
+                "http",
+                id="only_env_vars",
+            ),
+            pytest.param(
+                {
+                    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:1234",
+                    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "http://localhost:2222",
+                    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+                    "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": "grpc",
+                },
+                None,
+                None,
+                "localhost:2222",
+                "grpc",
+                id="type_specific_vars_take_precedence",
+            ),
+            pytest.param(
+                {},
+                "::1",
+                "4318",
+                "http://[::1]:4318/v1/metrics",
+                "http",
+                id="airflow_config_ipv6_loopback_is_bracketed",
+            ),
+            pytest.param(
+                {},
+                "2001:db8::1",
+                "4318",
+                "http://[2001:db8::1]:4318/v1/metrics",
+                "http",
+                id="airflow_config_ipv6_literal_is_bracketed",
+            ),
+            pytest.param(
+                {},
+                "[::1]",
+                "4318",
+                "http://[::1]:4318/v1/metrics",
+                "http",
+                id="airflow_config_already_bracketed_ipv6_is_preserved",
+            ),
+            pytest.param(
+                {},
+                "10.0.0.1",
+                "4318",
+                "http://10.0.0.1:4318/v1/metrics",
+                "http",
+                id="airflow_config_ipv4_literal_passes_through_unchanged",
+            ),
+        ],
+    )
+    def test_config_priorities(
+        self,
+        provided_env_vars,
+        airflow_conf_host,
+        airflow_conf_port,
+        expected_endpoint,
+        expected_exporter_module,
+    ):
+        with env_vars(provided_env_vars):
+            otel_env_config = load_metrics_env_config()
+
+            otel_metric_exporter = get_otel_data_exporter(
+                otel_env_config=otel_env_config,
+                host=airflow_conf_host,
+                port=airflow_conf_port,
+            )
+
+            assert otel_metric_exporter._endpoint == expected_endpoint
+
+            assert (
+                otel_metric_exporter.__class__.__module__
+                == f"opentelemetry.exporter.otlp.proto.{expected_exporter_module}.metric_exporter"
+            )
+
+    @mock.patch("airflow_shared.observability.metrics.otel_logger.metrics")
+    @mock.patch("airflow_shared.observability.metrics.otel_logger.MeterProvider")
+    def test_get_otel_logger_uses_exponential_histogram_view(self, mock_provider, mock_metrics):
+        get_otel_logger(host="localhost", port=4318)
+
+        call_kwargs = mock_provider.call_args.kwargs
+        views = call_kwargs["views"]
+        assert len(views) == 1
+        view = views[0]
+        assert isinstance(view, View)
+        assert isinstance(view._aggregation, ExponentialBucketHistogramAggregation)
+
+    def test_atexit_flush_on_process_exit(self):
+        """
+        Run a process that initializes a logger, creates a stat and then exits.
+
+        The logger initialization registers an atexit hook.
+        Test that the hook runs and flushes the created stat at shutdown.
+        """
+        function_call_str = (
+            "from airflow_shared.observability.metrics.otel_logger import get_otel_logger; "
+            "logger = get_otel_logger(debug=True); "
+            "logger.incr('my_test_stat')"
+        )
+
+        proc = subprocess.run(
+            [sys.executable, "-c", function_call_str],
+            check=False,
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+
+        assert proc.returncode == 0, f"Process failed\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+
+        assert "my_test_stat" in proc.stdout, (
+            "Expected the metric name to be present in the stdout but it wasn't.\n"
+            f"stdout:\n{proc.stdout}\n"
+            f"stderr:\n{proc.stderr}"
+        )
+
+    def test_reinit_after_fork_exports_metrics(self):
+        """Calling get_otel_logger() twice (simulating post-fork re-init) should still export metrics.
+
+        Reproduces https://github.com/apache/airflow/issues/64690: the OTel SDK's Once()
+        guard on set_meter_provider() survives fork, preventing the child from setting a
+        fresh MeterProvider. The fix resets the guard before each set_meter_provider() call.
+        """
+        test_module_name = "tests.observability.metrics.test_otel_logger"
+        function_call_str = f"import {test_module_name} as m; m.mock_service_run_reinit()"
+
+        proc = subprocess.run(
+            [sys.executable, "-c", function_call_str],
+            check=False,
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+
+        assert proc.returncode == 0, f"Process failed\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+
+        assert "post_fork_stat" in proc.stdout, (
+            "Expected 'post_fork_stat' in stdout after re-initialization but it wasn't found. "
+            "This suggests set_meter_provider() failed due to the Once() guard.\n"
+            f"stdout:\n{proc.stdout}\n"
+            f"stderr:\n{proc.stderr}"
+        )
+
+
+def mock_service_run():
+    logger = get_otel_logger(debug=True)
+    logger.incr("my_test_stat")
+
+
+def mock_service_run_reinit():
+    """Simulate re-initialization after fork by calling get_otel_logger() twice.
+
+    The first call sets the global MeterProvider and the Once() guard.
+    The second call simulates what happens in a forked child: stats.py detects
+    a PID mismatch and calls the factory again. Without the fix, the second
+    set_meter_provider() silently fails and the child uses a stale provider.
+    """
+    # First init — sets Once._done = True
+    get_otel_logger(debug=True)
+    # Second init — simulates post-fork re-initialization
+    logger = get_otel_logger(debug=True)
+    logger.incr("post_fork_stat")

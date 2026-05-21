@@ -61,14 +61,18 @@ def import_all_models():
         __getattr__(name)
 
     import airflow.models.asset
+    import airflow.models.asset_state
     import airflow.models.backfill
     import airflow.models.dag_favorite
     import airflow.models.dag_version
     import airflow.models.dagbag
     import airflow.models.dagbundle
     import airflow.models.dagwarning
+    import airflow.models.deadline_alert
     import airflow.models.errors
+    import airflow.models.revoked_token
     import airflow.models.serialized_dag
+    import airflow.models.task_state
     import airflow.models.taskinstancehistory
     import airflow.models.tasklog
     import airflow.models.team
@@ -107,13 +111,14 @@ __lazy_imports = {
     "DagWarning": "airflow.models.dagwarning",
     "DbCallbackRequest": "airflow.models.db_callback_request",
     "Deadline": "airflow.models.deadline",
+    "DeadlineAlert": "airflow.models.deadline_alert",
     "Log": "airflow.models.log",
     "HITLDetail": "airflow.models.hitl",
     "MappedOperator": "airflow.sdk.definitions.mappedoperator",
     "Param": "airflow.sdk.definitions.param",
     "Pool": "airflow.models.pool",
     "RenderedTaskInstanceFields": "airflow.models.renderedtifields",
-    "SkipMixin": "airflow.models.skipmixin",
+    "SkipMixin": "airflow.sdk.bases.skipmixin",
     "TaskInstance": "airflow.models.taskinstance",
     "TaskReschedule": "airflow.models.taskreschedule",
     "Team": "airflow.models.team",
@@ -135,16 +140,17 @@ if TYPE_CHECKING:
     from airflow.models.dagwarning import DagWarning
     from airflow.models.db_callback_request import DbCallbackRequest
     from airflow.models.deadline import Deadline
+    from airflow.models.deadline_alert import DeadlineAlert
     from airflow.models.log import Log
     from airflow.models.pool import Pool
     from airflow.models.renderedtifields import RenderedTaskInstanceFields
-    from airflow.models.skipmixin import SkipMixin
     from airflow.models.taskinstance import TaskInstance, clear_task_instances
     from airflow.models.taskinstancehistory import TaskInstanceHistory
     from airflow.models.taskreschedule import TaskReschedule
     from airflow.models.trigger import Trigger
     from airflow.models.variable import Variable
     from airflow.sdk import DAG, BaseOperator, BaseOperatorLink, Param
+    from airflow.sdk.bases.skipmixin import SkipMixin
     from airflow.sdk.bases.xcom import BaseXCom
     from airflow.sdk.definitions.mappedoperator import MappedOperator
     from airflow.sdk.execution_time.xcom import XCom
@@ -171,6 +177,9 @@ __deprecated_classes = {
     },
     "baseoperatorlink": {
         "BaseOperatorLink": "airflow.sdk.BaseOperatorLink",
+    },
+    "skipmixin": {
+        "SkipMixin": "airflow.sdk.bases.skipmixin.SkipMixin",
     },
     "operator": {
         "BaseOperator": "airflow.sdk.BaseOperator",

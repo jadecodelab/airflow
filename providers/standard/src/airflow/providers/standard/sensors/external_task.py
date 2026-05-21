@@ -62,8 +62,7 @@ else:
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
-    from airflow.models.taskinstancekey import TaskInstanceKey
-    from airflow.providers.common.compat.sdk import Context
+    from airflow.providers.common.compat.sdk import Context, TaskInstanceKey
 
 
 class ExternalDagLink(BaseOperatorLink):
@@ -83,8 +82,17 @@ class ExternalDagLink(BaseOperatorLink):
 
         if not AIRFLOW_V_3_0_PLUS:
             from airflow.models.renderedtifields import RenderedTaskInstanceFields
+            from airflow.models.taskinstancekey import TaskInstanceKey as CoreTaskInstanceKey
 
-            if template_fields := RenderedTaskInstanceFields.get_templated_fields(ti_key):
+            core_ti_key = CoreTaskInstanceKey(
+                dag_id=ti_key.dag_id,
+                task_id=ti_key.task_id,
+                run_id=ti_key.run_id,
+                try_number=ti_key.try_number,
+                map_index=ti_key.map_index,
+            )
+
+            if template_fields := RenderedTaskInstanceFields.get_templated_fields(core_ti_key):
                 external_dag_id: str = template_fields.get("external_dag_id", operator.external_dag_id)  # type: ignore[no-redef]
 
         if AIRFLOW_V_3_0_PLUS:
@@ -189,7 +197,9 @@ class ExternalTaskSensor(BaseSensorOperator):
     ):
         super().__init__(**kwargs)
 
-        self.allowed_states = list(allowed_states) if allowed_states else [TaskInstanceState.SUCCESS.value]
+        self.allowed_states: list[str] = (
+            list(allowed_states) if allowed_states else [TaskInstanceState.SUCCESS.value]
+        )
         self.skipped_states = list(skipped_states) if skipped_states else []
         self.failed_states = list(failed_states) if failed_states else []
 
@@ -424,10 +434,15 @@ class ExternalTaskSensor(BaseSensorOperator):
         if not self.deferrable:
             super().execute(context)
         else:
+            # Determine the timeout to use: prefer timeout parameter, fallback to execution_timeout
+            timeout_value = self.timeout
+            if not timeout_value and self.execution_timeout:
+                timeout_value = self.execution_timeout.total_seconds()
+
             dttm_filter = self._get_dttm_filter(context)
             if AIRFLOW_V_3_0_PLUS:
                 self.defer(
-                    timeout=self.execution_timeout,
+                    timeout=datetime.timedelta(seconds=timeout_value) if timeout_value else None,
                     trigger=WorkflowTrigger(
                         external_dag_id=self.external_dag_id,
                         external_task_group_id=self.external_task_group_id,
@@ -444,8 +459,15 @@ class ExternalTaskSensor(BaseSensorOperator):
                     method_name="execute_complete",
                 )
             else:
+                # TODO: Remove this block when Airflow 2 support is dropped
+                if self.check_existence and not self._has_checked_existence:
+                    from airflow.utils.session import create_session
+
+                    with create_session() as session:
+                        self._check_for_existence(session=session)
+
                 self.defer(
-                    timeout=self.execution_timeout,
+                    timeout=datetime.timedelta(seconds=timeout_value) if timeout_value else None,
                     trigger=WorkflowTrigger(
                         external_dag_id=self.external_dag_id,
                         external_task_group_id=self.external_task_group_id,

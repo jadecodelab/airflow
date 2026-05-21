@@ -30,8 +30,19 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast, overload
 import attr
 
 from airflow.sdk._shared.module_loading import import_string, iter_namespace, qualname
-from airflow.sdk._shared.observability.metrics.stats import Stats
+from airflow.sdk._shared.observability.metrics import stats
+from airflow.sdk._shared.serialization import (
+    CLASSNAME,
+    DATA,
+    OLD_DATA,
+    OLD_DICT,
+    OLD_TYPE,
+    OLD_TYPE_TO_FULL_QUALNAME,
+    SCHEMA_ID,
+    VERSION,
+)
 from airflow.sdk.configuration import conf
+from airflow.sdk.observability.metrics import stats_utils
 from airflow.sdk.serde.typing import is_pydantic_model
 
 if TYPE_CHECKING:
@@ -41,16 +52,6 @@ log = logging.getLogger(__name__)
 
 MAX_RECURSION_DEPTH = sys.getrecursionlimit() - 1
 
-CLASSNAME = "__classname__"
-VERSION = "__version__"
-DATA = "__data__"
-SCHEMA_ID = "__id__"
-CACHE = "__cache__"
-
-OLD_TYPE = "__type"
-OLD_SOURCE = "__source"
-OLD_DATA = "__var"
-OLD_DICT = "dict"
 PYDANTIC_MODEL_QUALNAME = "pydantic.main.BaseModel"
 
 DEFAULT_VERSION = 0
@@ -307,7 +308,11 @@ def _convert(old: dict) -> dict:
         # Return old style dicts directly as they do not need wrapping
         if old[OLD_TYPE] == OLD_DICT:
             return old[OLD_DATA]
-        return {CLASSNAME: old[OLD_TYPE], VERSION: DEFAULT_VERSION, DATA: old[OLD_DATA]}
+        return {
+            CLASSNAME: OLD_TYPE_TO_FULL_QUALNAME.get(old[OLD_TYPE], old[OLD_TYPE]),
+            VERSION: DEFAULT_VERSION,
+            DATA: old[OLD_DATA],
+        }
 
     return old
 
@@ -327,8 +332,10 @@ def _match_glob(classname: str):
 @functools.cache
 def _match_regexp(classname: str):
     """Check if the given classname matches a pattern from allowed_deserialization_classes_regexp using regexp."""
+    # fullmatch (not match) so a pattern like ``airflow\.models\.Variable`` cannot also admit
+    # ``airflow.models.Variable_Malicious`` — re.match only anchors at the start of the string.
     patterns = _get_regexp_patterns()
-    return any(p.match(classname) is not None for p in patterns)
+    return any(p.fullmatch(classname) is not None for p in patterns)
 
 
 def _stringify(classname: str, version: int, value: T | None) -> str:
@@ -370,13 +377,12 @@ def _register():
     _deserializers.clear()
     _stringifiers.clear()
 
-    Stats.initialize(
-        is_statsd_datadog_enabled=conf.getboolean("metrics", "statsd_datadog_enabled"),
-        is_statsd_on=conf.getboolean("metrics", "statsd_on"),
-        is_otel_on=conf.getboolean("metrics", "otel_on"),
+    stats.initialize(
+        factory=stats_utils.get_stats_factory(),
+        export_legacy_names=conf.getboolean("metrics", "legacy_names_on"),
     )
 
-    with Stats.timer("serde.load_serializers") as timer:
+    with stats.timer("serde.load_serializers") as timer:
         serializers_module = import_module("airflow.sdk.serde.serializers")
         for _, module_name, _ in iter_namespace(serializers_module):
             module = import_module(module_name)
@@ -386,7 +392,6 @@ def _register():
                     raise AttributeError(
                         f"duplicate {s_qualname} for serialization in {module} and {_serializers[s_qualname]}"
                     )
-                log.debug("registering %s for serialization", s_qualname)
                 _serializers[s_qualname] = module
             for deserializers in getattr(module, "deserializers", ()):
                 d_qualname = deserializers if isinstance(deserializers, str) else qualname(deserializers)
@@ -394,7 +399,6 @@ def _register():
                     raise AttributeError(
                         f"duplicate {d_qualname} for deserialization in {module} and {_deserializers[d_qualname]}"
                     )
-                log.debug("registering %s for deserialization", d_qualname)
                 _deserializers[d_qualname] = module
                 _extra_allowed.add(d_qualname)
             for stringifiers in getattr(module, "stringifiers", ()):
@@ -403,10 +407,15 @@ def _register():
                     raise AttributeError(
                         f"duplicate {c_qualname} for stringifiers in {module} and {_stringifiers[c_qualname]}"
                     )
-                log.debug("registering %s for stringifying", c_qualname)
                 _stringifiers[c_qualname] = module
 
-    log.debug("loading serializers took %.3f seconds", timer.duration)
+    log.debug(
+        "registered serializers=[%s] deserializers=[%s] stringifiers=[%s] in %.3f ms",
+        ", ".join(sorted(_serializers)),
+        ", ".join(sorted(_deserializers)),
+        ", ".join(sorted(_stringifiers)),
+        timer.duration,
+    )
 
 
 @functools.cache

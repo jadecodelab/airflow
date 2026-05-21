@@ -18,6 +18,7 @@
  */
 
 export * from "./Dialog";
+export * from "./IconButton";
 export * from "./Pagination";
 export * from "./Select";
 export * from "./Alert";
@@ -34,3 +35,5 @@ export * from "./Checkbox";
 export * from "./ResetButton";
 export * from "./InputWithAddon";
 export * from "./ButtonGroupToggle";
+export * from "./LazyClipboard";
+export * from "./RouterLink";

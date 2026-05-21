@@ -21,8 +21,7 @@ import { useTranslation } from "react-i18next";
 import { FiEdit } from "react-icons/fi";
 
 import type { ConnectionResponse } from "openapi/requests/types.gen";
-import { Dialog } from "src/components/ui";
-import ActionButton from "src/components/ui/ActionButton";
+import { Dialog, IconButton } from "src/components/ui";
 import { useEditConnection } from "src/queries/useEditConnection";
 
 import ConnectionForm from "./ConnectionForm";
@@ -59,18 +58,10 @@ const EditConnectionButton = ({ connection, disabled }: Props) => {
 
   return (
     <>
-      <ActionButton
-        actionName={translate("connections.edit")}
-        disabled={disabled}
-        icon={<FiEdit />}
-        onClick={() => {
-          onOpen();
-        }}
-        text={translate("connections.edit")}
-        withText={false}
-      />
-
-      <Dialog.Root onOpenChange={handleClose} open={open} size="xl">
+      <IconButton disabled={disabled} label={translate("connections.edit")} onClick={onOpen}>
+        <FiEdit />
+      </IconButton>
+      <Dialog.Root lazyMount onOpenChange={handleClose} open={open} unmountOnExit>
         <Dialog.Content backdrop>
           <Dialog.Header>
             <Heading size="xl">{translate("connections.edit")}</Heading>

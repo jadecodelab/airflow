@@ -27,6 +27,76 @@
 Changelog
 ---------
 
+4.6.0
+.....
+
+Features
+~~~~~~~~
+
+* ``Add uri sanitizers and asset factories for new schemes (#66426)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Add explicit [tool.flit.sdist] sections to flit-based pyproject.tomls (#65861)``
+   * ``Fix stale system test documentation links (#65071)``
+
+4.5.3
+.....
+
+Misc
+~~~~
+
+* ``Load hook metadata from YAML without importing Hook class (#63826)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+
+4.5.2
+.....
+
+Misc
+~~~~
+
+* ``Add Python 3.14 Support (#63520)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Add *.iml to .gitignore in all distributions (#63636)``
+
+4.5.1
+.....
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Use conn.schema as service_name fallback in OracleHook (#62895)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+
+4.5.0
+.....
+
+Features
+~~~~~~~~
+
+* ``feat: Add Hook Level Lineage to SQL hooks (#61535)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Add 'lifecycle' field to provider.yaml schema and all providers per AIP-95 (#62190)``
+
+4.4.0
+.....
+
+Features
+~~~~~~~~
+
+* ``Implement specialized get_first and get_records method in OracleHook to avoid serialization issues with XCom's (#61144)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+
 4.3.1
 .....
 

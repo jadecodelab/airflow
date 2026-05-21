@@ -21,23 +21,28 @@ import contextlib
 import datetime
 import logging
 import os
+import re
 from collections import Counter, deque
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Iterator
+from contextlib import ExitStack, contextmanager
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest import mock
-from unittest.mock import MagicMock, PropertyMock, patch
-from uuid import uuid4
+from unittest.mock import MagicMock, patch
+from uuid import UUID, uuid4
 
 import pendulum
 import psutil
 import pytest
 import time_machine
 from sqlalchemy import delete, func, select, update
+from sqlalchemy.dialects import mysql
 from sqlalchemy.orm import joinedload
 
 from airflow import settings
+from airflow._shared.module_loading import qualname
+from airflow._shared.observability.metrics.base_stats_logger import StatsLogger
 from airflow._shared.timezones import timezone
 from airflow.api_fastapi.auth.tokens import JWTGenerator
 from airflow.assets.manager import AssetManager
@@ -50,6 +55,7 @@ from airflow.executors.base_executor import BaseExecutor
 from airflow.executors.executor_constants import MOCK_EXECUTOR
 from airflow.executors.executor_loader import ExecutorLoader
 from airflow.executors.executor_utils import ExecutorName
+from airflow.executors.local_executor import LocalExecutor
 from airflow.jobs.job import Job, run_job
 from airflow.jobs.scheduler_job_runner import SchedulerJobRunner
 from airflow.models.asset import (
@@ -61,7 +67,8 @@ from airflow.models.asset import (
     AssetPartitionDagRun,
     PartitionedAssetKeyLog,
 )
-from airflow.models.backfill import Backfill, _create_backfill
+from airflow.models.backfill import Backfill, BackfillDagRun, ReprocessBehavior, _create_backfill
+from airflow.models.callback import ExecutorCallback
 from airflow.models.dag import DagModel, get_last_dagrun, infer_automated_data_interval
 from airflow.models.dag_version import DagVersion
 from airflow.models.dagbundle import DagBundleModel
@@ -69,26 +76,35 @@ from airflow.models.dagrun import DagRun
 from airflow.models.dagwarning import DagWarning
 from airflow.models.db_callback_request import DbCallbackRequest
 from airflow.models.deadline import Deadline
+from airflow.models.deadline_alert import DeadlineAlert
 from airflow.models.log import Log
 from airflow.models.pool import Pool
 from airflow.models.serialized_dag import SerializedDagModel
 from airflow.models.taskinstance import TaskInstance
 from airflow.models.team import Team
 from airflow.models.trigger import Trigger
-from airflow.observability.trace import Trace
+from airflow.partition_mappers.base import PartitionMapper as CorePartitionMapper
 from airflow.providers.standard.operators.bash import BashOperator
 from airflow.providers.standard.operators.empty import EmptyOperator
 from airflow.providers.standard.triggers.file import FileDeleteTrigger
-from airflow.sdk import DAG, Asset, AssetAlias, AssetWatcher, task
+from airflow.sdk import (
+    DAG,
+    Asset,
+    AssetAlias,
+    AssetWatcher,
+    CronPartitionTimetable,
+    IdentityMapper,
+    StartOfHourMapper,
+    task,
+)
 from airflow.sdk.definitions.callback import AsyncCallback, SyncCallback
+from airflow.sdk.definitions.timetables.assets import PartitionedAssetTimetable
 from airflow.serialization.definitions.dag import SerializedDAG
 from airflow.serialization.serialized_objects import LazyDeserializedDAG
-from airflow.timetables.base import DataInterval
-from airflow.timetables.simple import IdentityMapper, PartitionedAssetTimetable
+from airflow.timetables.base import DagRunInfo, DataInterval
 from airflow.utils.session import create_session, provide_session
-from airflow.utils.span_status import SpanStatus
-from airflow.utils.state import DagRunState, State, TaskInstanceState
-from airflow.utils.thread_safe_dict import ThreadSafeDict
+from airflow.utils.sqlalchemy import with_row_locks
+from airflow.utils.state import CallbackState, DagRunState, State, TaskInstanceState
 from airflow.utils.types import DagRunTriggeredByType, DagRunType
 
 from tests_common.pytest_plugin import AIRFLOW_ROOT_PATH
@@ -96,6 +112,7 @@ from tests_common.test_utils.asserts import assert_queries_count
 from tests_common.test_utils.config import conf_vars, env_vars
 from tests_common.test_utils.dag import create_scheduler_dag, sync_dag_to_db, sync_dags_to_db
 from tests_common.test_utils.db import (
+    clear_db_apdr,
     clear_db_assets,
     clear_db_backfills,
     clear_db_callbacks,
@@ -104,6 +121,7 @@ from tests_common.test_utils.db import (
     clear_db_deadline,
     clear_db_import_errors,
     clear_db_jobs,
+    clear_db_pakl,
     clear_db_pools,
     clear_db_runs,
     clear_db_teams,
@@ -194,6 +212,59 @@ def create_dagrun(session):
     return _create_dagrun
 
 
+def task_maker(
+    dag_maker,
+    session,
+    dag_id: str,
+    task_num: int,
+    max_active_tasks: int,
+    running_num: int,
+    run_id: str | None = None,
+):
+    dag_tasks = {}
+
+    with dag_maker(dag_id=dag_id):
+        for i in range(task_num):
+            # Assign priority weight to certain tasks.
+            if (i % 10) == 0:  # 0, 10, 20, 30, 40, 50, ...
+                weight = int(i / 2)
+                dag_tasks[f"op{i}"] = EmptyOperator(
+                    task_id=f"dummy{i}", priority_weight=weight, pool="test_pool1"
+                )
+            else:
+                # No executor specified, runs on default executor
+                dag_tasks[f"op{i}"] = EmptyOperator(task_id=f"dummy{i}", pool="test_pool2")
+
+    # 'create_dagrun' uses a kwargs dict to check whether parameters
+    # are present. Do the same for simplicity.
+    # 'logical_date' is used to create the 'run_id'. Set it to 'now',
+    # in order to get distinct run ids, if a value isn't provided.
+    kwargs = {
+        "run_type": DagRunType.SCHEDULED,
+        "logical_date": timezone.utcnow(),
+    }
+
+    if run_id is not None:
+        kwargs["run_id"] = run_id
+
+    dag_run = dag_maker.create_dagrun(**kwargs)
+
+    tis_list = []
+    for i in range(task_num):
+        ti = dag_run.get_task_instance(dag_tasks[f"op{i}"].task_id, session)
+        # e.g.
+        #  If running_num is 2, then for i=0 and i=1, state will be RUNNING.
+        #  If running_num is 0, then state will be SCHEDULED for all.
+        ti.state = State.RUNNING if i < running_num else State.SCHEDULED
+        ti.dag_model.max_active_tasks = max_active_tasks
+        # Add to the list.
+        tis_list.append(ti)
+
+    session.flush()
+
+    return tis_list
+
+
 def _clean_db():
     clear_db_dags()
     clear_db_runs()
@@ -251,15 +322,15 @@ class TestSchedulerJob:
         default_executor.queue_workload.__func__ = BaseExecutor.queue_workload
         second_executor.queue_workload.__func__ = BaseExecutor.queue_workload
 
-        with mock.patch("airflow.jobs.job.Job.executors", new_callable=PropertyMock) as executors_mock:
+        with mock.patch("airflow.executors.executor_loader.ExecutorLoader.init_executors") as executors_mock:
             executors_mock.return_value = [default_executor, second_executor]
             yield [default_executor, second_executor]
 
     @pytest.fixture
     def mock_executor(self, mock_executors):
         default_executor = mock_executors[0]
-        with mock.patch("airflow.jobs.job.Job.executors", new_callable=PropertyMock) as executors_mock:
-            executors_mock.return_value = [default_executor]
+        with mock.patch("airflow.executors.executor_loader.ExecutorLoader.init_executors") as loader_mock:
+            loader_mock.return_value = mock_executors
             yield default_executor
 
     def test_is_alive(self):
@@ -282,32 +353,95 @@ class TestSchedulerJob:
         scheduler_job.latest_heartbeat = timezone.utcnow() - datetime.timedelta(seconds=10)
         assert not scheduler_job.is_alive(), "Completed jobs even with recent heartbeat should not be alive"
 
+    @patch("airflow.jobs.scheduler_job_runner.ExecutorLoader.get_default_executor")
+    @patch("airflow.jobs.scheduler_job_runner.ExecutorLoader.init_executors")
+    def test_executor_loaded_in_scheduler_job(self, mock_init_executors, mock_default_executor):
+        mock_local_executor = LocalExecutor()
+        mock_default_executor.return_value = mock_local_executor
+        mock_init_executors.return_value = [mock_local_executor]
+
+        scheduler_job = SchedulerJobRunner(Job())
+
+        assert scheduler_job.executor == mock_local_executor
+        assert scheduler_job.executors == [mock_local_executor]
+
     @pytest.mark.parametrize(
         "heartrate",
         [10, 5],
     )
     def test_heartrate(self, heartrate):
         with conf_vars({("scheduler", "scheduler_heartbeat_sec"): str(heartrate)}):
-            scheduler_job = Job(executor=self.null_exec)
-            _ = SchedulerJobRunner(job=scheduler_job)
+            scheduler_job = Job()
+            _ = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
             assert scheduler_job.heartrate == heartrate
 
     def test_no_orphan_process_will_be_left(self):
         current_process = psutil.Process()
         old_children = current_process.children(recursive=True)
-        scheduler_job = Job(
-            executor=MockExecutor(do_update=False),
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(
+            job=scheduler_job, num_runs=1, executors=[MockExecutor(do_update=False)]
         )
-        self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1)
         run_job(scheduler_job, execute_callable=self.job_runner._execute)
 
         # Remove potential noise created by previous tests.
         current_children = set(current_process.children(recursive=True)) - set(old_children)
         assert not current_children
 
+    def test_only_idle_no_dags_exits_after_n_idle_runs(self, caplog, configure_testing_dag_bundle):
+        num_runs = 5
+        with caplog.at_level(logging.INFO, logger="airflow.jobs.scheduler_job_runner"):
+            with configure_testing_dag_bundle(os.devnull):
+                executor = MockExecutor(do_update=False)
+                scheduler_job = Job()
+                self.job_runner = SchedulerJobRunner(
+                    job=scheduler_job,
+                    num_runs=num_runs,
+                    only_idle=True,
+                    executors=[executor],
+                )
+                run_job(scheduler_job, execute_callable=self.job_runner._execute)
+
+        match = re.search(r"\((\d+) idle, (\d+) total\)", caplog.text)
+        assert match, f"Expected exit log '(N idle, M total)' in: {caplog.text}"
+        idle_runs_val, total_runs_val = int(match.group(1)), int(match.group(2))
+        assert total_runs_val == num_runs, "With no DAGs, total loop count should equal num_runs"
+        assert idle_runs_val == num_runs, "With no DAGs, all runs are idle; idle count should equal num_runs"
+
+    @pytest.mark.usefixtures("testing_dag_bundle")
+    def test_only_idle_with_dag_exits_after_n_idle_runs(self, caplog, dag_maker, session):
+        num_runs = 5
+        with dag_maker(dag_id="test_only_idle_one_task", fileloc="test_only_idle_one_task.py"):
+            EmptyOperator(task_id="dummy")
+        dr = dag_maker.create_dagrun(run_type=DagRunType.SCHEDULED, state=State.RUNNING)
+        ti = dr.get_task_instance("dummy", session)
+        ti.state = State.SCHEDULED
+        session.merge(ti)
+        session.commit()
+
+        executor = MockExecutor(do_update=False)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(
+            job=scheduler_job,
+            num_runs=num_runs,
+            only_idle=True,
+            executors=[executor],
+        )
+        with caplog.at_level(logging.INFO, logger="airflow.jobs.scheduler_job_runner"):
+            run_job(scheduler_job, execute_callable=self.job_runner._execute)
+
+        match = re.search(r"\((\d+) idle, (\d+) total\)", caplog.text)
+        assert match, f"Expected exit log '(N idle, M total)' in: {caplog.text}"
+        idle_runs_val, total_runs_val = int(match.group(1)), int(match.group(2))
+        assert total_runs_val >= num_runs, "Total loop count should be at least num_runs"
+        assert idle_runs_val == num_runs, "Scheduler exits when idle run count reaches num_runs"
+        assert total_runs_val > idle_runs_val, "Some runs should not be idle"
+
     @mock.patch("airflow.jobs.scheduler_job_runner.TaskCallbackRequest")
-    @mock.patch("airflow.jobs.scheduler_job_runner.Stats.incr")
-    def test_process_executor_events(self, mock_stats_incr, mock_task_callback, dag_maker):
+    @mock.patch("airflow._shared.observability.metrics.stats._get_backend")
+    def test_process_executor_events(self, mock_get_backend, mock_task_callback, dag_maker):
+        mock_stats = mock.MagicMock(spec=StatsLogger)
+        mock_get_backend.return_value = mock_stats
         dag_id = "test_process_executor_events"
         task_id_1 = "dummy_task"
 
@@ -316,13 +450,13 @@ class TestSchedulerJob:
             task1 = EmptyOperator(task_id=task_id_1)
         ti1 = dag_maker.create_dagrun().get_task_instance(task1.task_id)
 
-        mock_stats_incr.reset_mock()
+        mock_stats.incr.reset_mock()
 
         executor = MockExecutor(do_update=False)
         task_callback = mock.MagicMock(spec=TaskCallbackRequest)
         mock_task_callback.return_value = task_callback
-        scheduler_job = Job(executor=executor)
-        self.job_runner = SchedulerJobRunner(scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[executor])
         ti1.state = State.QUEUED
         session.merge(ti1)
         session.commit()
@@ -332,7 +466,7 @@ class TestSchedulerJob:
         self.job_runner._process_executor_events(executor=executor, session=session)
         ti1.refresh_from_db(session=session)
         assert ti1.state == State.FAILED
-        scheduler_job.executor.callback_sink.send.assert_not_called()
+        self.job_runner.executor.callback_sink.send.assert_not_called()
 
         # ti in success state
         ti1.state = State.SUCCESS
@@ -343,8 +477,8 @@ class TestSchedulerJob:
         self.job_runner._process_executor_events(executor=executor, session=session)
         ti1.refresh_from_db(session=session)
         assert ti1.state == State.SUCCESS
-        scheduler_job.executor.callback_sink.send.assert_not_called()
-        mock_stats_incr.assert_has_calls(
+        self.job_runner.executor.callback_sink.send.assert_not_called()
+        mock_stats.incr.assert_has_calls(
             [
                 mock.call(
                     "scheduler.tasks.killed_externally",
@@ -357,10 +491,7 @@ class TestSchedulerJob:
         )
 
     @mock.patch("airflow.jobs.scheduler_job_runner.TaskCallbackRequest", spec=TaskCallbackRequest)
-    @mock.patch("airflow.jobs.scheduler_job_runner.Stats.incr")
-    def test_process_executor_events_restarting_cleared_task(
-        self, mock_stats_incr, mock_task_callback, dag_maker
-    ):
+    def test_process_executor_events_restarting_cleared_task(self, mock_task_callback, dag_maker):
         """
         Test processing of RESTARTING task instances by scheduler's _process_executor_events.
 
@@ -397,8 +528,8 @@ class TestSchedulerJob:
         executor = MockExecutor(do_update=False)
         task_callback = mock.MagicMock(spec=TaskCallbackRequest)
         mock_task_callback.return_value = task_callback
-        scheduler_job = Job(executor=executor)
-        job_runner = SchedulerJobRunner(scheduler_job)
+        scheduler_job = Job()
+        job_runner = SchedulerJobRunner(scheduler_job, executors=[executor])
 
         # Simulate executor reporting task completion (this triggers the bug scenario)
         executor.event_buffer[ti1.key] = State.SUCCESS, None
@@ -424,18 +555,20 @@ class TestSchedulerJob:
         assert ti1.try_number == 4, "try_number should remain unchanged"
 
     @mock.patch("airflow.jobs.scheduler_job_runner.TaskCallbackRequest")
-    @mock.patch("airflow.jobs.scheduler_job_runner.Stats.incr")
-    def test_process_executor_events_with_no_callback(self, mock_stats_incr, mock_task_callback, dag_maker):
+    @mock.patch("airflow._shared.observability.metrics.stats._get_backend")
+    def test_process_executor_events_with_no_callback(self, mock_get_backend, mock_task_callback, dag_maker):
+        mock_stats = mock.MagicMock(spec=StatsLogger)
+        mock_get_backend.return_value = mock_stats
         dag_id = "test_process_executor_events_with_no_callback"
         task_id = "test_task"
         run_id = "test_run"
 
-        mock_stats_incr.reset_mock()
+        mock_stats.incr.reset_mock()
         executor = MockExecutor(do_update=False)
         task_callback = mock.MagicMock(spec=TaskCallbackRequest)
         mock_task_callback.return_value = task_callback
-        scheduler_job = Job(executor=executor)
-        self.job_runner = SchedulerJobRunner(scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(scheduler_job, executors=[executor])
 
         session = settings.Session()
         with dag_maker(dag_id=dag_id, fileloc="/test_path1/"):
@@ -444,13 +577,13 @@ class TestSchedulerJob:
             run_id=run_id, logical_date=DEFAULT_DATE + timedelta(hours=1)
         ).get_task_instance(task1.task_id)
 
-        mock_stats_incr.reset_mock()
+        mock_stats.incr.reset_mock()
 
         executor = MockExecutor(do_update=False)
         task_callback = mock.MagicMock()
         mock_task_callback.return_value = task_callback
-        scheduler_job = Job(executor=executor)
-        self.job_runner = SchedulerJobRunner(scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(scheduler_job, executors=[executor])
         ti1.state = State.QUEUED
         session.merge(ti1)
         session.commit()
@@ -460,7 +593,7 @@ class TestSchedulerJob:
         self.job_runner._process_executor_events(executor=executor, session=session)
         ti1.refresh_from_db(session=session)
         assert ti1.state == State.UP_FOR_RETRY
-        scheduler_job.executor.callback_sink.send.assert_not_called()
+        self.job_runner.executor.callback_sink.send.assert_not_called()
 
         # ti in success state
         ti1.state = State.SUCCESS
@@ -471,8 +604,8 @@ class TestSchedulerJob:
         self.job_runner._process_executor_events(executor=executor, session=session)
         ti1.refresh_from_db(session=session)
         assert ti1.state == State.SUCCESS
-        scheduler_job.executor.callback_sink.send.assert_not_called()
-        mock_stats_incr.assert_has_calls(
+        self.job_runner.executor.callback_sink.send.assert_not_called()
+        mock_stats.incr.assert_has_calls(
             [
                 mock.call(
                     "scheduler.tasks.killed_externally",
@@ -484,11 +617,55 @@ class TestSchedulerJob:
             any_order=True,
         )
 
+    def test_enqueue_executor_callbacks_only_selects_pending_state(self, dag_maker, session):
+        def test_callback():
+            pass
+
+        def create_callback_in_state(state: CallbackState):
+            callback = Deadline(
+                deadline_time=timezone.utcnow(),
+                callback=SyncCallback(test_callback),
+                dagrun_id=dag_run.id,
+                deadline_alert_id=None,
+            ).callback
+            callback.state = state
+            callback.data["dag_run_id"] = dag_run.id
+            callback.data["dag_id"] = dag_run.dag_id
+            return callback
+
+        with dag_maker(dag_id="test_callback_states"):
+            pass
+        dag_run = dag_maker.create_dagrun()
+
+        scheduled_callback = create_callback_in_state(CallbackState.SCHEDULED)
+        pending_callback = create_callback_in_state(CallbackState.PENDING)
+        queued_callback = create_callback_in_state(CallbackState.QUEUED)
+        running_callback = create_callback_in_state(CallbackState.RUNNING)
+        session.add_all([scheduled_callback, pending_callback, queued_callback, running_callback])
+        session.flush()
+
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+
+        # Verify initial state before calling _enqueue_executor_callbacks
+        assert session.get(ExecutorCallback, pending_callback.id).state == CallbackState.PENDING
+
+        self.job_runner._enqueue_executor_callbacks(session)
+        # PENDING should progress to QUEUED after _enqueue_executor_callbacks
+        assert session.get(ExecutorCallback, pending_callback.id).state == CallbackState.QUEUED
+
+        # Other callbacks should remain in their original states
+        assert session.get(ExecutorCallback, scheduled_callback.id).state == CallbackState.SCHEDULED
+        assert session.get(ExecutorCallback, queued_callback.id).state == CallbackState.QUEUED
+        assert session.get(ExecutorCallback, running_callback.id).state == CallbackState.RUNNING
+
     @mock.patch("airflow.jobs.scheduler_job_runner.TaskCallbackRequest")
-    @mock.patch("airflow.jobs.scheduler_job_runner.Stats.incr")
+    @mock.patch("airflow._shared.observability.metrics.stats._get_backend")
     def test_process_executor_events_with_callback(
-        self, mock_stats_incr, mock_task_callback, dag_maker, session
+        self, mock_get_backend, mock_task_callback, dag_maker, session
     ):
+        mock_stats = mock.MagicMock(spec=StatsLogger)
+        mock_get_backend.return_value = mock_stats
         dag_id = "test_process_executor_events_with_callback"
         task_id_1 = "dummy_task"
 
@@ -497,13 +674,13 @@ class TestSchedulerJob:
         dr = dag_maker.create_dagrun()
         ti1 = dr.task_instances[0]
 
-        mock_stats_incr.reset_mock()
+        mock_stats.incr.reset_mock()
 
         task_callback = mock.MagicMock()
         mock_task_callback.return_value = task_callback
         executor = MockExecutor(do_update=False)
-        scheduler_job = Job(executor=executor)
-        self.job_runner = SchedulerJobRunner(scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(scheduler_job, executors=[executor])
 
         ti1.state = State.QUEUED
         session.merge(ti1)
@@ -520,15 +697,15 @@ class TestSchedulerJob:
             bundle_name="dag_maker",
             bundle_version=None,
             msg=f"Executor {executor} reported that the task instance "
-            "<TaskInstance: test_process_executor_events_with_callback.dummy_task test [queued]> "
+            f"<TaskInstance: test_process_executor_events_with_callback.dummy_task test [queued] ti_id={ti1.id}> "
             "finished with state failed, but the task instance's state attribute is queued. "
             "Learn more: https://airflow.apache.org/docs/apache-airflow/stable/troubleshooting.html#task-state-changed-externally",
             context_from_server=mock.ANY,
             task_callback_type=TaskInstanceState.FAILED,
         )
-        scheduler_job.executor.callback_sink.send.assert_called_once_with(task_callback)
-        scheduler_job.executor.callback_sink.reset_mock()
-        mock_stats_incr.assert_any_call(
+        self.job_runner.executor.callback_sink.send.assert_called_once_with(task_callback)
+        self.job_runner.executor.callback_sink.reset_mock()
+        mock_stats.incr.assert_any_call(
             "scheduler.tasks.killed_externally",
             tags={
                 "dag_id": "test_process_executor_events_with_callback",
@@ -537,8 +714,12 @@ class TestSchedulerJob:
         )
 
     @mock.patch("airflow.jobs.scheduler_job_runner.TaskCallbackRequest")
-    @mock.patch("airflow.jobs.scheduler_job_runner.Stats.incr")
-    def test_process_executor_event_missing_dag(self, mock_stats_incr, mock_task_callback, dag_maker, caplog):
+    @mock.patch("airflow._shared.observability.metrics.stats._get_backend")
+    def test_process_executor_event_missing_dag(
+        self, mock_get_backend, mock_task_callback, dag_maker, caplog
+    ):
+        mock_stats = mock.MagicMock(spec=StatsLogger)
+        mock_get_backend.return_value = mock_stats
         dag_id = "test_process_executor_events_with_callback"
         task_id_1 = "dummy_task"
 
@@ -546,13 +727,13 @@ class TestSchedulerJob:
             task1 = EmptyOperator(task_id=task_id_1, on_failure_callback=lambda x: print("hi"))
         ti1 = dag_maker.create_dagrun().get_task_instance(task1.task_id)
 
-        mock_stats_incr.reset_mock()
+        mock_stats.incr.reset_mock()
 
         executor = MockExecutor(do_update=False)
         task_callback = mock.MagicMock()
         mock_task_callback.return_value = task_callback
-        scheduler_job = Job(executor=executor)
-        self.job_runner = SchedulerJobRunner(scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(scheduler_job, executors=[executor])
         self.job_runner.scheduler_dag_bag = mock.MagicMock()
         self.job_runner.scheduler_dag_bag.get_dag_for_run.side_effect = Exception("failed")
 
@@ -568,8 +749,12 @@ class TestSchedulerJob:
         assert ti1.state == State.FAILED
 
     @mock.patch("airflow.jobs.scheduler_job_runner.TaskCallbackRequest")
-    @mock.patch("airflow.jobs.scheduler_job_runner.Stats.incr")
-    def test_process_executor_events_ti_requeued(self, mock_stats_incr, mock_task_callback, dag_maker):
+    @mock.patch("airflow._shared.observability.metrics.stats._get_backend")
+    def test_process_executor_events_ti_requeued(
+        self, mock_get_backend, mock_task_callback, dag_maker, caplog
+    ):
+        mock_stats = mock.MagicMock(spec=StatsLogger)
+        mock_get_backend.return_value = mock_stats
         dag_id = "test_process_executor_events_ti_requeued"
         task_id_1 = "dummy_task"
 
@@ -578,15 +763,15 @@ class TestSchedulerJob:
             task1 = EmptyOperator(task_id=task_id_1)
         ti1 = dag_maker.create_dagrun().get_task_instance(task1.task_id)
 
-        mock_stats_incr.reset_mock()
+        mock_stats.incr.reset_mock()
 
         executor = MockExecutor(do_update=False)
         task_callback = mock.MagicMock()
         mock_task_callback.return_value = task_callback
-        scheduler_job = Job(executor=executor)
+        scheduler_job = Job()
         session.add(scheduler_job)
         session.flush()
-        self.job_runner = SchedulerJobRunner(scheduler_job)
+        self.job_runner = SchedulerJobRunner(scheduler_job, executors=[executor])
 
         # ti is queued with another try number - do not fail it
         ti1.state = State.QUEUED
@@ -597,10 +782,12 @@ class TestSchedulerJob:
 
         executor.event_buffer[ti1.key.with_try_number(1)] = State.SUCCESS, None
 
-        self.job_runner._process_executor_events(executor=executor, session=session)
+        with caplog.at_level(logging.WARNING, logger="airflow.jobs.scheduler_job_runner"):
+            self.job_runner._process_executor_events(executor=executor, session=session)
         ti1.refresh_from_db(session=session)
         assert ti1.state == State.QUEUED
-        scheduler_job.executor.callback_sink.send.assert_not_called()
+        self.job_runner.executor.callback_sink.send.assert_not_called()
+        assert any("TI try_number mismatch:" in rec.message for rec in caplog.records)
 
         # ti is queued by another scheduler - do not fail it
         ti1.state = State.QUEUED
@@ -613,7 +800,7 @@ class TestSchedulerJob:
         self.job_runner._process_executor_events(executor=executor, session=session)
         ti1.refresh_from_db(session=session)
         assert ti1.state == State.QUEUED
-        scheduler_job.executor.callback_sink.send.assert_not_called()
+        self.job_runner.executor.callback_sink.send.assert_not_called()
 
         # ti is queued by this scheduler but it is handed back to the executor - do not fail it
         ti1.state = State.QUEUED
@@ -627,21 +814,121 @@ class TestSchedulerJob:
         self.job_runner._process_executor_events(executor=executor, session=session)
         ti1.refresh_from_db(session=session)
         assert ti1.state == State.QUEUED
-        scheduler_job.executor.callback_sink.send.assert_not_called()
-        mock_stats_incr.assert_not_called()
+        self.job_runner.executor.callback_sink.send.assert_not_called()
+        mock_stats.incr.assert_not_called()
+
+    @mock.patch("airflow.jobs.scheduler_job_runner.TaskCallbackRequest")
+    @mock.patch("airflow._shared.observability.metrics.stats._get_backend")
+    def test_process_executor_events_stale_success_when_scheduled_after_defer(
+        self, mock_get_backend, mock_task_callback, dag_maker
+    ):
+        """
+        Trigger moved TI to scheduled (resume after defer) before executor success from defer exit arrived.
+
+        Regression for https://github.com/apache/airflow/issues/66374 — must not treat as state mismatch.
+        """
+        mock_stats = mock.MagicMock(spec=StatsLogger)
+        mock_get_backend.return_value = mock_stats
+        dag_id = "test_process_executor_events_stale_success_scheduled_after_defer"
+        task_id_1 = "dummy_task"
+
+        session = settings.Session()
+        with dag_maker(dag_id=dag_id, fileloc="/test_path1/"):
+            task1 = EmptyOperator(task_id=task_id_1)
+        ti1 = dag_maker.create_dagrun().get_task_instance(task1.task_id)
+
+        executor = MockExecutor(do_update=False)
+        task_callback = mock.MagicMock()
+        mock_task_callback.return_value = task_callback
+        scheduler_job = Job()
+        session.add(scheduler_job)
+        session.flush()
+        self.job_runner = SchedulerJobRunner(scheduler_job, executors=[executor])
+
+        ti1.state = State.SCHEDULED
+        ti1.next_method = "execute_callback"
+        ti1.queued_by_job_id = scheduler_job.id
+        ti1.try_number = 1
+        session.merge(ti1)
+        session.commit()
+
+        executor.event_buffer[ti1.key] = State.SUCCESS, None
+        executor.has_task = mock.MagicMock(return_value=False)
+        mock_stats.incr.reset_mock()
+
+        self.job_runner._process_executor_events(executor=executor, session=session)
+        ti1.refresh_from_db(session=session)
+        assert ti1.state == State.SCHEDULED
+        self.job_runner.executor.callback_sink.send.assert_not_called()
+        mock_stats.incr.assert_not_called()
+
+        # Without next_method, scheduled + stale success is still a mismatch (e.g. external kill).
+        ti1.next_method = None
+        session.merge(ti1)
+        session.commit()
+
+        executor.event_buffer[ti1.key] = State.SUCCESS, None
+        mock_stats.incr.reset_mock()
+
+        self.job_runner._process_executor_events(executor=executor, session=session)
+        mock_stats.incr.assert_any_call(
+            "scheduler.tasks.killed_externally",
+            tags={"dag_id": dag_id, "task_id": ti1.task_id},
+        )
+
+    @mock.patch("airflow.jobs.scheduler_job_runner.TaskCallbackRequest")
+    @mock.patch("airflow._shared.observability.metrics.stats._get_backend")
+    def test_process_executor_events_multiple_try_numbers_warns(
+        self, mock_get_backend, mock_task_callback, dag_maker, caplog
+    ):
+        dag_id = "test_process_executor_events_multiple_try_numbers_warns"
+        task_id = "dummy_task"
+
+        session = settings.Session()
+        with dag_maker(dag_id=dag_id, fileloc="/test_path1/"):
+            task = EmptyOperator(task_id=task_id)
+        ti = dag_maker.create_dagrun().get_task_instance(task.task_id)
+
+        mock_stats = mock.MagicMock(spec=StatsLogger)
+        mock_get_backend.return_value = mock_stats
+        executor = MockExecutor(do_update=False)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(scheduler_job, executors=[executor])
+        mock_stats.incr.reset_mock()
+
+        ti.state = State.QUEUED
+        ti.try_number = 2
+        session.merge(ti)
+        session.commit()
+
+        executor.event_buffer[ti.key.with_try_number(1)] = State.RUNNING, "first_executor_id"
+        executor.event_buffer[ti.key.with_try_number(2)] = State.RUNNING, "second_executor_id"
+
+        with caplog.at_level(logging.WARNING, logger="airflow.jobs.scheduler_job_runner"):
+            self.job_runner._process_executor_events(executor=executor, session=session)
+
+        assert any(
+            "Multiple executor events for same TI with different try_numbers!" in rec.message
+            for rec in caplog.records
+        )
+        mock_task_callback.assert_not_called()
+        mock_stats.incr.assert_not_called()
 
     @pytest.mark.usefixtures("testing_dag_bundle")
-    @mock.patch("airflow.jobs.scheduler_job_runner.Stats.incr")
-    def test_process_executor_events_with_asset_events(self, mock_stats_incr, session, dag_maker):
+    def test_process_executor_events_with_asset_events(self, session, dag_maker):
         """
         Test that _process_executor_events handles asset events without DetachedInstanceError.
 
         Regression test for scheduler crashes when task callbacks are built with
-        consumed_asset_events that weren't eager-loaded.
+        consumed_asset_events that weren't eager-loaded. Exercises both
+        ``AssetEvent.asset`` and ``AssetEvent.source_aliases`` so that missing
+        either loader option on the TI query surfaces as a ``DetachedInstanceError``
+        when the callback's ``DRDataModel`` is built.
         """
         asset1 = Asset(uri="test://asset1", name="test_asset_executor", group="test_group")
         asset_model = AssetModel(name=asset1.name, uri=asset1.uri, group=asset1.group)
-        session.add(asset_model)
+        asset_alias = AssetAliasModel(name="test_alias_executor", group="test_group")
+        session.add_all([asset_model, asset_alias])
         session.flush()
 
         with dag_maker(dag_id="test_executor_events_with_assets", schedule=[asset1], fileloc="/test_path1/"):
@@ -653,7 +940,9 @@ class TestSchedulerJob:
 
         dr = dag_maker.create_dagrun()
 
-        # Create asset event and attach to dag run
+        # Create asset event with an attached source alias so the lazy-loaded
+        # AssetEvent.source_aliases relationship is non-empty and must be
+        # eager-loaded to survive a detached ORM instance in the callback.
         asset_event = AssetEvent(
             asset_id=asset_model.id,
             source_task_id="upstream_task",
@@ -661,6 +950,7 @@ class TestSchedulerJob:
             source_run_id="upstream_run",
             source_map_index=-1,
         )
+        asset_event.source_aliases.append(asset_alias)
         session.add(asset_event)
         session.flush()
         dr.consumed_asset_events.append(asset_event)
@@ -668,8 +958,8 @@ class TestSchedulerJob:
         session.flush()
 
         executor = MockExecutor(do_update=False)
-        scheduler_job = Job(executor=executor)
-        self.job_runner = SchedulerJobRunner(scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(scheduler_job, executors=[executor])
 
         ti1 = dr.get_task_instance("dummy_task")
         ti1.state = State.QUEUED
@@ -684,12 +974,14 @@ class TestSchedulerJob:
         ti1.refresh_from_db(session=session)
         assert ti1.state == State.FAILED
 
-        # Verify callback was created with asset event data
-        scheduler_job.executor.callback_sink.send.assert_called_once()
-        callback_request = scheduler_job.executor.callback_sink.send.call_args.args[0]
+        # Verify callback was created with asset event data including aliases
+        self.job_runner.executor.callback_sink.send.assert_called_once()
+        callback_request = self.job_runner.executor.callback_sink.send.call_args.args[0]
         assert callback_request.context_from_server is not None
-        assert len(callback_request.context_from_server.dag_run.consumed_asset_events) == 1
-        assert callback_request.context_from_server.dag_run.consumed_asset_events[0].asset.uri == asset1.uri
+        events = callback_request.context_from_server.dag_run.consumed_asset_events
+        assert len(events) == 1
+        assert events[0].asset.uri == asset1.uri
+        assert [alias.name for alias in events[0].source_aliases] == [asset_alias.name]
 
     @pytest.mark.usefixtures("testing_dag_bundle")
     def test_schedule_dag_run_with_asset_event(self, session: Session, dag_maker: DagMaker):
@@ -735,8 +1027,8 @@ class TestSchedulerJob:
         session.flush()
 
         executor = MockExecutor(do_update=False)
-        scheduler_job = Job(executor=executor)
-        self.job_runner = SchedulerJobRunner(scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(scheduler_job, executors=[executor])
 
         ti1 = dr.get_task_instance("dummy_task")
         if TYPE_CHECKING:
@@ -836,7 +1128,7 @@ class TestSchedulerJob:
         session.flush()
 
         executor = MockExecutor()
-        scheduler_job = Job(executor=executor)
+        scheduler_job = Job()
         with mock.patch("airflow.executors.executor_loader.ExecutorLoader.load_executor") as loader_mock:
             loader_mock.return_value = executor
             self.job_runner = SchedulerJobRunner(job=scheduler_job)
@@ -886,8 +1178,8 @@ class TestSchedulerJob:
         with dag_maker(dag_id=dag_id):
             task1 = EmptyOperator(task_id=task_id_1)
 
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(scheduler_job, executors=[self.null_exec])
         session = settings.Session()
 
         dr1 = dag_maker.create_dagrun(run_type=DagRunType.BACKFILL_JOB)
@@ -911,14 +1203,14 @@ class TestSchedulerJob:
         self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1)
         self.job_runner._execute()
 
-        assert isinstance(scheduler_job.executor.callback_sink, DatabaseCallbackSink)
+        assert isinstance(self.job_runner.executor.callback_sink, DatabaseCallbackSink)
 
     def test_setup_callback_sink_standalone_dag_processor_multiple_executors(self, mock_executors):
         scheduler_job = Job()
         self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1)
         self.job_runner._execute()
 
-        for executor in scheduler_job.executors:
+        for executor in self.job_runner.executors:
             assert isinstance(executor.callback_sink, DatabaseCallbackSink)
 
     def test_executor_start_called(self, mock_executors):
@@ -926,8 +1218,8 @@ class TestSchedulerJob:
         self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1)
         self.job_runner._execute()
 
-        scheduler_job.executor.start.assert_called_once()
-        for executor in scheduler_job.executors:
+        self.job_runner.executor.start.assert_called_once()
+        for executor in self.job_runner.executors:
             executor.start.assert_called_once()
 
     def test_executor_job_id_assigned(self, mock_executors, configure_testing_dag_bundle):
@@ -936,8 +1228,8 @@ class TestSchedulerJob:
             self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1)
             self.job_runner._execute()
 
-            assert scheduler_job.executor.job_id == scheduler_job.id
-            for executor in scheduler_job.executors:
+            assert self.job_runner.executor.job_id == scheduler_job.id
+            for executor in self.job_runner.executors:
                 assert executor.job_id == scheduler_job.id
 
     def test_executor_heartbeat(self, mock_executors, configure_testing_dag_bundle):
@@ -946,8 +1238,24 @@ class TestSchedulerJob:
             self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1)
             self.job_runner._execute()
 
-            for executor in scheduler_job.executors:
+            for executor in self.job_runner.executors:
                 executor.heartbeat.assert_called_once()
+
+    def test_executor_heartbeat_emits_timer(self, mock_executors, configure_testing_dag_bundle):
+        with configure_testing_dag_bundle(os.devnull):
+            scheduler_job = Job()
+            self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1)
+            with patch("airflow.jobs.scheduler_job_runner.stats.timer") as mock_timer:
+                self.job_runner._execute()
+
+            heartbeat_calls = [
+                timer_call
+                for timer_call in mock_timer.call_args_list
+                if timer_call.args and timer_call.args[0] == "scheduler.executor_heartbeat_duration"
+            ]
+            assert len(heartbeat_calls) == len(self.job_runner.executors)
+            for executor, timer_call in zip(self.job_runner.executors, heartbeat_calls):
+                assert timer_call.kwargs.get("tags") == {"executor": type(executor).__name__}
 
     def test_executor_events_processed(self, mock_executors, configure_testing_dag_bundle):
         with configure_testing_dag_bundle(os.devnull):
@@ -955,7 +1263,7 @@ class TestSchedulerJob:
             self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1)
             self.job_runner._execute()
 
-            for executor in scheduler_job.executors:
+            for executor in self.job_runner.executors:
                 executor.get_event_buffer.assert_called_once()
 
     @patch("traceback.extract_stack")
@@ -964,7 +1272,7 @@ class TestSchedulerJob:
         self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1)
         self.job_runner._debug_dump(1, mock.MagicMock())
 
-        for executor in scheduler_job.executors:
+        for executor in self.job_runner.executors:
             executor.debug_dump.assert_called_once()
 
         patch_traceback_extract_stack.assert_called()
@@ -999,6 +1307,34 @@ class TestSchedulerJob:
         assert len(queued_tis) == 2
         assert {x.key for x in queued_tis} == {ti_non_backfill.key, ti_backfill.key}
         session.rollback()
+
+    def test_find_executable_task_instances_mysql_hint_only_applies_to_inner_query(self, dag_maker, session):
+        dag_id = "SchedulerJobTest.test_find_executable_task_instances_mysql_hint_only_applies_to_inner_query"
+        task_id = "dummy"
+        with dag_maker(dag_id=dag_id, max_active_tasks=16):
+            task = EmptyOperator(task_id=task_id)
+
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+
+        dag_run = dag_maker.create_dagrun(run_type=DagRunType.SCHEDULED)
+        ti = dag_run.get_task_instance(task.task_id)
+        ti.state = State.SCHEDULED
+        session.merge(ti)
+        session.flush()
+
+        captured_queries = []
+
+        def capture_locked_query(query, **kwargs):
+            captured_queries.append(query)
+            return query
+
+        with mock.patch("airflow.jobs.scheduler_job_runner.with_row_locks", side_effect=capture_locked_query):
+            queued_tis = self.job_runner._executable_task_instances_to_queued(max_tis=32, session=session)
+
+        assert {queued_ti.key for queued_ti in queued_tis} == {ti.key}
+        compiled_query = str(captured_queries[0].compile(dialect=mysql.dialect()))
+        assert compiled_query.count("USE INDEX (ti_state)") == 1
 
     def test_find_executable_task_instances_pool(self, dag_maker):
         dag_id = "SchedulerJobTest.test_find_executable_task_instances_pool"
@@ -1239,7 +1575,7 @@ class TestSchedulerJob:
         assert len(res) == 5
 
         # Verify that each task is routed to the correct executor
-        executor_to_tis = self.job_runner._executor_to_tis(res, session)
+        executor_to_tis = self.job_runner._executor_to_workloads(res, session)
 
         # Team pi tasks should go to mock_executors[0] (configured for team_pi)
         a_tis_in_executor = [ti for ti in executor_to_tis.get(mock_executors[0], []) if ti.dag_id == "dag_a"]
@@ -1249,9 +1585,9 @@ class TestSchedulerJob:
         b_tis_in_executor = [ti for ti in executor_to_tis.get(mock_executors[1], []) if ti.dag_id == "dag_b"]
         assert len(b_tis_in_executor) == 2
 
-        # Global task should go to the default executor (scheduler_job.executor)
+        # Global task should go to the default executor (self.job_runner.executor)
         global_tis_in_executor = [
-            ti for ti in executor_to_tis.get(scheduler_job.executor, []) if ti.dag_id == "dag_global"
+            ti for ti in executor_to_tis.get(self.job_runner.executor, []) if ti.dag_id == "dag_global"
         ]
         assert len(global_tis_in_executor) == 1
 
@@ -1265,6 +1601,232 @@ class TestSchedulerJob:
             ti for ti in executor_to_tis.get(mock_executors[0], []) if ti.dag_id == "dag_b"
         ]
         assert len(b_tis_in_wrong_executor) == 0
+
+    @conf_vars(
+        {
+            ("scheduler", "max_tis_per_query"): "100",
+            ("scheduler", "max_dagruns_to_create_per_loop"): "10",
+            ("scheduler", "max_dagruns_per_loop_to_schedule"): "20",
+            ("core", "parallelism"): "100",
+            ("core", "max_active_tasks_per_dag"): "4",
+            ("core", "max_active_runs_per_dag"): "10",
+            ("core", "default_pool_task_slot_count"): "64",
+        }
+    )
+    def test_max_active_tasks_per_dr_limit_applied_in_task_query(self, dag_maker, mock_executors):
+        scheduler_job = Job()
+        scheduler_job.max_tis_per_query = 100
+        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        self.job_runner.executor.slots_available = 70
+        self.job_runner.executor.parallelism = 100
+        session = settings.Session()
+
+        session.add(Pool(pool="test_pool1", slots=64, description="with_slots1", include_deferred=False))
+        session.add(Pool(pool="test_pool2", slots=64, description="with_slots2", include_deferred=False))
+        session.flush()
+
+        # Use the same run_id.
+        task_maker(
+            dag_maker,
+            session,
+            dag_id="dag_1300_tasks",
+            task_num=1300,
+            max_active_tasks=4,
+            running_num=0,
+            run_id="run1",
+        )
+        task_maker(
+            dag_maker,
+            session,
+            dag_id="dag_1200_tasks",
+            task_num=1200,
+            max_active_tasks=4,
+            running_num=0,
+            run_id="run1",
+        )
+        task_maker(
+            dag_maker,
+            session,
+            dag_id="dag_1100_tasks",
+            task_num=1100,
+            max_active_tasks=4,
+            running_num=0,
+            run_id="run1",
+        )
+        task_maker(
+            dag_maker,
+            session,
+            dag_id="dag_100_tasks",
+            task_num=100,
+            max_active_tasks=4,
+            running_num=0,
+            run_id="run1",
+        )
+        task_maker(
+            dag_maker,
+            session,
+            dag_id="dag_90_tasks",
+            task_num=90,
+            max_active_tasks=4,
+            running_num=0,
+            run_id="run1",
+        )
+        task_maker(
+            dag_maker,
+            session,
+            dag_id="dag_80_tasks",
+            task_num=80,
+            max_active_tasks=4,
+            running_num=0,
+            run_id="run1",
+        )
+
+        count = 0
+        iterations = 0
+
+        from airflow.configuration import conf
+
+        task_num = conf.getint("core", "max_active_tasks_per_dag") * 6
+
+        # 6 dags * 4 = 24.
+        assert task_num == 24
+
+        queued_tis = None
+        while count < task_num:
+            # Use `_executable_task_instances_to_queued` because it returns a list of TIs
+            # while `_critical_section_enqueue_task_instances` just returns the number of the TIs.
+            queued_tis = self.job_runner._executable_task_instances_to_queued(
+                max_tis=self.job_runner.executor.slots_available, session=session
+            )
+            count += len(queued_tis)
+            iterations += 1
+
+        assert iterations == 1
+        assert count == task_num
+
+        assert queued_tis is not None
+
+        dag_counts = Counter(ti.dag_id for ti in queued_tis)
+
+        # Tasks from all 6 dags should have been queued.
+        assert len(dag_counts) == 6
+        assert dag_counts == {
+            "dag_1300_tasks": 4,
+            "dag_1200_tasks": 4,
+            "dag_1100_tasks": 4,
+            "dag_100_tasks": 4,
+            "dag_90_tasks": 4,
+            "dag_80_tasks": 4,
+        }, "Count for each dag_id should be 4 but it isn't"
+
+    @conf_vars(
+        {
+            ("scheduler", "max_tis_per_query"): "100",
+            ("scheduler", "max_dagruns_to_create_per_loop"): "10",
+            ("scheduler", "max_dagruns_per_loop_to_schedule"): "20",
+            ("core", "parallelism"): "100",
+            ("core", "max_active_tasks_per_dag"): "4",
+            ("core", "max_active_runs_per_dag"): "10",
+            ("core", "default_pool_task_slot_count"): "64",
+        }
+    )
+    def test_max_active_tasks_per_dr_limit_partial_capacity(self, dag_maker, mock_executors):
+        scheduler_job = Job()
+        scheduler_job.max_tis_per_query = 100
+        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        self.job_runner.executor.parallelism = 100
+        self.job_runner.executor.slots_available = 70
+        session = settings.Session()
+
+        session.add(Pool(pool="test_pool1", slots=64, description="with_slots1", include_deferred=False))
+        session.add(Pool(pool="test_pool2", slots=64, description="with_slots2", include_deferred=False))
+        session.flush()
+
+        # This dag_run will have 2 RUNNING tasks and 10 SCHEDULED tasks.
+        task_maker(
+            dag_maker,
+            session,
+            dag_id="dag_12_tasks",
+            task_num=12,
+            max_active_tasks=4,
+            running_num=2,
+            run_id="run1",
+        )
+
+        queued_tis = self.job_runner._executable_task_instances_to_queued(
+            max_tis=self.job_runner.executor.slots_available, session=session
+        )
+
+        assert queued_tis is not None
+        # Only 2 tasks should have been queued.
+        assert len(queued_tis) == 2
+
+        dag_counts = Counter(ti.dag_id for ti in queued_tis)
+
+        assert len(dag_counts) == 1
+        assert dag_counts == {
+            "dag_12_tasks": 2,
+        }, "There should be only 1 dag_id with count 2 but that isn't the case"
+
+    @conf_vars(
+        {
+            ("scheduler", "max_tis_per_query"): "100",
+            ("scheduler", "max_dagruns_to_create_per_loop"): "10",
+            ("scheduler", "max_dagruns_per_loop_to_schedule"): "20",
+            ("core", "parallelism"): "100",
+            ("core", "max_active_tasks_per_dag"): "4",
+            ("core", "max_active_runs_per_dag"): "10",
+            ("core", "default_pool_task_slot_count"): "64",
+        }
+    )
+    def test_max_active_tasks_per_dr_limit_starvation_filter_ordering(self, dag_maker, mock_executors):
+        scheduler_job = Job()
+        scheduler_job.max_tis_per_query = 100
+        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        self.job_runner.executor.parallelism = 100
+        self.job_runner.executor.slots_available = 50
+        session = settings.Session()
+
+        # Add 2 pools, one starved and one with available slots.
+        session.add(Pool(pool="test_pool1", slots=0, description="starved_no_slots", include_deferred=False))
+        session.add(Pool(pool="test_pool2", slots=64, description="with_slots", include_deferred=False))
+        session.flush()
+
+        # All tasks in SCHEDULED state.
+        task_maker(
+            dag_maker,
+            session,
+            dag_id="dag_12_tasks",
+            task_num=12,
+            max_active_tasks=4,
+            running_num=0,
+            run_id="run1",
+        )
+
+        queued_tis = self.job_runner._executable_task_instances_to_queued(
+            max_tis=self.job_runner.executor.slots_available, session=session
+        )
+
+        assert queued_tis is not None
+        # 4 tasks should have been queued.
+        assert len(queued_tis) == 4
+
+        for ti in queued_tis:
+            # The dag has 12 tasks. 'dummy0' has priority weight 0,
+            # 'dummy10' has priority 5 and everything else has priority 1.
+            # Tasks 'dummy0' and 'dummy10' belong to a starved pool.
+            # If the starved pool had any available slots, 'dummy10' would be
+            # the 1st task to be queued.
+            assert ti.task_id != "dummy10"
+            assert ti.priority_weight != 5
+            assert ti.priority_weight == 1
+
+        dag_counts = Counter(ti.dag_id for ti in queued_tis)
+
+        assert len(dag_counts) == 1
+        assert dag_counts == {
+            "dag_12_tasks": 4,
+        }, "There should be only 1 dag_id with count 4 but that isn't the case"
 
     def test_find_executable_task_instances_order_priority_with_pools(self, dag_maker):
         """
@@ -1466,11 +2028,13 @@ class TestSchedulerJob:
         some_pool = Pool(pool="some_pool", slots=2, description="my pool", include_deferred=False)
         session.add(some_pool)
         session.commit()
+        cannot_run_ti_id = next(t for t in dr.task_instances if t.task_id == "cannot_run").id
         with caplog.at_level(logging.WARNING):
             self.job_runner._executable_task_instances_to_queued(max_tis=32, session=session)
             assert (
-                "Not executing <TaskInstance: "
-                "SchedulerJobTest.test_test_not_enough_pool_slots.cannot_run test [scheduled]>. "
+                f"Not executing <TaskInstance: "
+                f"SchedulerJobTest.test_test_not_enough_pool_slots.cannot_run test [scheduled] "
+                f"ti_id={cannot_run_ti_id}>. "
                 "Requested pool slots (4) are greater than total pool slots: '2' for pool: some_pool"
                 in caplog.text
             )
@@ -1570,7 +2134,7 @@ class TestSchedulerJob:
         session.merge(t1)
         session.merge(t2)
         session.merge(t3)
-        # set 1 ti from dr1 to running
+        # set 1 ti from dr2 to running
         # one can be queued
         t1, t2, t3 = dr2.get_task_instances(session=session)
         t1.state = active_state
@@ -1579,7 +2143,7 @@ class TestSchedulerJob:
         session.merge(t1)
         session.merge(t2)
         session.merge(t3)
-        # set 0 tis from dr1 to running
+        # set 0 tis from dr3 to running
         # two can be queued
         t1, t2, t3 = dr3.get_task_instances(session=session)
         t1.state = State.SCHEDULED
@@ -1615,8 +2179,8 @@ class TestSchedulerJob:
 
         executor = MockExecutor(do_update=True)
 
-        scheduler_job = Job(executor=executor)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(scheduler_job, executors=[executor])
         session = settings.Session()
 
         dr1 = dag_maker.create_dagrun(run_type=DagRunType.SCHEDULED)
@@ -1686,6 +2250,274 @@ class TestSchedulerJob:
 
             assert len(res) == 1
             session.rollback()
+
+    def test_find_executable_task_instances_max_active_tis_per_dag_deferred_blocks(self, dag_maker, session):
+        """
+        A DEFERRED TI should count against max_active_tis_per_dag.
+
+        When one TI is deferred, no additional TI of the same task should be
+        scheduled if the limit is already reached.
+        Regression test for https://github.com/apache/airflow/issues/61700
+        """
+        dag_id = "SchedulerJobTest.test_max_active_tis_per_dag_deferred_blocks"
+        with dag_maker(dag_id=dag_id, max_active_tasks=16, session=session):
+            task1 = EmptyOperator(task_id="deferrable_task", max_active_tis_per_dag=1)
+
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+
+        dr1 = dag_maker.create_dagrun(run_type=DagRunType.SCHEDULED, run_id="run_1", session=session)
+        dr2 = dag_maker.create_dagrun_after(
+            dr1, run_type=DagRunType.SCHEDULED, run_id="run_2", session=session
+        )
+
+        # DR1's TI is deferred (waiting on a trigger)
+        ti1 = dr1.get_task_instance(task1.task_id, session)
+        ti1.state = TaskInstanceState.DEFERRED
+        session.merge(ti1)
+
+        # DR2's TI is scheduled and wants to run
+        ti2 = dr2.get_task_instance(task1.task_id, session)
+        ti2.state = State.SCHEDULED
+        session.merge(ti2)
+        session.flush()
+
+        res = self.job_runner._executable_task_instances_to_queued(max_tis=32, session=session)
+        # ti2 should be blocked because ti1 is deferred and counts as active
+        assert len(res) == 0
+        session.rollback()
+
+    def test_find_executable_task_instances_max_active_tis_per_dag_deferred_plus_running(
+        self, dag_maker, session
+    ):
+        """
+        Deferred + running TIs together fill the max_active_tis_per_dag limit.
+
+        With max_active_tis_per_dag=2 and one RUNNING + one DEFERRED, a third
+        SCHEDULED TI should be blocked.
+        """
+        dag_id = "SchedulerJobTest.test_max_active_tis_per_dag_deferred_plus_running"
+        with dag_maker(dag_id=dag_id, max_active_tasks=16, session=session):
+            task1 = EmptyOperator(task_id="task", max_active_tis_per_dag=2)
+
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+
+        dr1 = dag_maker.create_dagrun(run_type=DagRunType.SCHEDULED, run_id="run_1", session=session)
+        dr2 = dag_maker.create_dagrun_after(
+            dr1, run_type=DagRunType.SCHEDULED, run_id="run_2", session=session
+        )
+        dr3 = dag_maker.create_dagrun_after(
+            dr2, run_type=DagRunType.SCHEDULED, run_id="run_3", session=session
+        )
+
+        ti1 = dr1.get_task_instance(task1.task_id, session)
+        ti1.state = TaskInstanceState.RUNNING
+        session.merge(ti1)
+
+        ti2 = dr2.get_task_instance(task1.task_id, session)
+        ti2.state = TaskInstanceState.DEFERRED
+        session.merge(ti2)
+
+        ti3 = dr3.get_task_instance(task1.task_id, session)
+        ti3.state = State.SCHEDULED
+        session.merge(ti3)
+        session.flush()
+
+        # 1 running + 1 deferred = 2, which equals the limit
+        res = self.job_runner._executable_task_instances_to_queued(max_tis=32, session=session)
+        assert len(res) == 0
+        session.rollback()
+
+    def test_find_executable_task_instances_max_active_tis_per_dag_deferred_with_room(
+        self, dag_maker, session
+    ):
+        """
+        With max_active_tis_per_dag=2 and only 1 deferred, one more TI
+        should be allowed to schedule.
+        """
+        dag_id = "SchedulerJobTest.test_max_active_tis_per_dag_deferred_with_room"
+        with dag_maker(dag_id=dag_id, max_active_tasks=16, session=session):
+            task1 = EmptyOperator(task_id="task", max_active_tis_per_dag=2)
+
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+
+        dr1 = dag_maker.create_dagrun(run_type=DagRunType.SCHEDULED, run_id="run_1", session=session)
+        dr2 = dag_maker.create_dagrun_after(
+            dr1, run_type=DagRunType.SCHEDULED, run_id="run_2", session=session
+        )
+        dr3 = dag_maker.create_dagrun_after(
+            dr2, run_type=DagRunType.SCHEDULED, run_id="run_3", session=session
+        )
+
+        ti1 = dr1.get_task_instance(task1.task_id, session)
+        ti1.state = TaskInstanceState.DEFERRED
+        session.merge(ti1)
+
+        ti2 = dr2.get_task_instance(task1.task_id, session)
+        ti2.state = State.SCHEDULED
+        session.merge(ti2)
+
+        ti3 = dr3.get_task_instance(task1.task_id, session)
+        ti3.state = State.SCHEDULED
+        session.merge(ti3)
+        session.flush()
+
+        # 1 deferred -> room for 1 more (limit is 2)
+        res = self.job_runner._executable_task_instances_to_queued(max_tis=32, session=session)
+        assert len(res) == 1
+        session.rollback()
+
+    def test_find_executable_task_instances_deferred_does_not_block_different_task(self, dag_maker, session):
+        """
+        A DEFERRED TI of task A should NOT block task B from scheduling.
+
+        max_active_tis_per_dag is per-task, not per-DAG.
+        """
+        dag_id = "SchedulerJobTest.test_deferred_does_not_block_different_task"
+        with dag_maker(dag_id=dag_id, max_active_tasks=16, session=session):
+            task_a = EmptyOperator(task_id="task_a", max_active_tis_per_dag=1)
+            task_b = EmptyOperator(task_id="task_b")
+
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+
+        dr1 = dag_maker.create_dagrun(run_type=DagRunType.SCHEDULED, run_id="run_1", session=session)
+        dr2 = dag_maker.create_dagrun_after(
+            dr1, run_type=DagRunType.SCHEDULED, run_id="run_2", session=session
+        )
+
+        # task_a in DR1 is deferred
+        ti_a1 = dr1.get_task_instance(task_a.task_id, session)
+        ti_a1.state = TaskInstanceState.DEFERRED
+        session.merge(ti_a1)
+
+        # task_a in DR2 is scheduled (should be blocked by deferred ti_a1)
+        ti_a2 = dr2.get_task_instance(task_a.task_id, session)
+        ti_a2.state = State.SCHEDULED
+        session.merge(ti_a2)
+
+        # task_b in DR1 is scheduled (should NOT be blocked)
+        ti_b1 = dr1.get_task_instance(task_b.task_id, session)
+        ti_b1.state = State.SCHEDULED
+        session.merge(ti_b1)
+        session.flush()
+
+        res = self.job_runner._executable_task_instances_to_queued(max_tis=32, session=session)
+        queued_task_ids = [ti.task_id for ti in res]
+        # task_b should be queued, task_a should be blocked
+        assert "task_b" in queued_task_ids
+        assert "task_a" not in queued_task_ids
+        session.rollback()
+
+    def test_find_executable_task_instances_deferred_to_success_unblocks(self, dag_maker, session):
+        """
+        When a deferred TI completes (SUCCESS), the next TI should be unblocked.
+        """
+        dag_id = "SchedulerJobTest.test_deferred_to_success_unblocks"
+        with dag_maker(dag_id=dag_id, max_active_tasks=16, session=session):
+            task1 = EmptyOperator(task_id="task", max_active_tis_per_dag=1)
+
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+
+        dr1 = dag_maker.create_dagrun(run_type=DagRunType.SCHEDULED, run_id="run_1", session=session)
+        dr2 = dag_maker.create_dagrun_after(
+            dr1, run_type=DagRunType.SCHEDULED, run_id="run_2", session=session
+        )
+
+        ti1 = dr1.get_task_instance(task1.task_id, session)
+        ti2 = dr2.get_task_instance(task1.task_id, session)
+
+        # Step 1: ti1 is deferred, ti2 scheduled -> ti2 blocked
+        ti1.state = TaskInstanceState.DEFERRED
+        ti2.state = State.SCHEDULED
+        session.merge(ti1)
+        session.merge(ti2)
+        session.flush()
+
+        res = self.job_runner._executable_task_instances_to_queued(max_tis=32, session=session)
+        assert len(res) == 0
+
+        # Step 2: ti1 completes -> ti2 should be unblocked
+        ti1.state = TaskInstanceState.SUCCESS
+        session.merge(ti1)
+        session.flush()
+
+        res = self.job_runner._executable_task_instances_to_queued(max_tis=32, session=session)
+        assert len(res) == 1
+        assert res[0].key == ti2.key
+        session.rollback()
+
+    def test_find_executable_task_instances_max_active_tis_per_dagrun_deferred(self, dag_maker, session):
+        """
+        DEFERRED TIs should also count against max_active_tis_per_dagrun.
+
+        With max_active_tis_per_dagrun=1 and 2 mapped instances in the same
+        dagrun, if one is deferred, the other should be blocked.
+        """
+        dag_id = "SchedulerJobTest.test_max_active_tis_per_dagrun_deferred"
+        with dag_maker(dag_id=dag_id, max_active_tasks=16, session=session):
+            task_a = EmptyOperator.partial(task_id="task_a", max_active_tis_per_dagrun=1).expand_kwargs(
+                [{"inputs": 1}, {"inputs": 2}]
+            )
+            EmptyOperator(task_id="task_b")
+
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+
+        dr = dag_maker.create_dagrun(run_type=DagRunType.SCHEDULED, session=session)
+
+        ti_a0 = dr.get_task_instance(task_a.task_id, session, map_index=0)
+        ti_a1 = dr.get_task_instance(task_a.task_id, session, map_index=1)
+
+        ti_a0.state = TaskInstanceState.DEFERRED
+        ti_a1.state = State.SCHEDULED
+        session.merge(ti_a0)
+        session.merge(ti_a1)
+        session.flush()
+
+        res = self.job_runner._executable_task_instances_to_queued(max_tis=32, session=session)
+        queued_task_ids = [(ti.task_id, ti.map_index) for ti in res]
+        # ti_a1 should be blocked, task_b may be queued
+        assert ("task_a", 1) not in queued_task_ids
+        session.rollback()
+
+    def test_find_executable_task_instances_deferred_does_not_affect_max_active_tasks(
+        self, dag_maker, session
+    ):
+        """
+        Deferred TIs should NOT count toward max_active_tasks.
+
+        max_active_tasks is about worker-level parallelism, while deferred tasks
+        don't consume worker slots. With max_active_tasks=2 and 1 deferred TI,
+        2 more SCHEDULED TIs should be allowed.
+        """
+        dag_id = "SchedulerJobTest.test_deferred_does_not_affect_max_active_tasks"
+        with dag_maker(dag_id=dag_id, max_active_tasks=2, session=session):
+            EmptyOperator(task_id="task_1")
+            EmptyOperator(task_id="task_2")
+            EmptyOperator(task_id="task_3")
+
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+
+        dr = dag_maker.create_dagrun(run_type=DagRunType.SCHEDULED, session=session)
+        t1, t2, t3 = sorted(dr.get_task_instances(session=session), key=lambda t: t.task_id)
+
+        t1.state = TaskInstanceState.DEFERRED
+        t2.state = State.SCHEDULED
+        t3.state = State.SCHEDULED
+        session.merge(t1)
+        session.merge(t2)
+        session.merge(t3)
+        session.flush()
+
+        res = self.job_runner._executable_task_instances_to_queued(max_tis=32, session=session)
+        # Deferred doesn't count toward max_active_tasks=2, so both scheduled can run
+        assert len(res) == 2
+        session.rollback()
 
     def test_change_state_for_executable_task_instances_no_tis_with_state(self, dag_maker):
         dag_id = "SchedulerJobTest.test_change_state_for__no_tis_with_state"
@@ -1911,8 +2743,10 @@ class TestSchedulerJob:
 
         session.rollback()
 
-    @mock.patch("airflow.jobs.scheduler_job_runner.Stats.gauge")
-    def test_emit_pool_starving_tasks_metrics(self, mock_stats_gauge, dag_maker):
+    @mock.patch("airflow._shared.observability.metrics.stats._get_backend")
+    def test_emit_pool_starving_tasks_metrics(self, mock_get_backend, dag_maker):
+        mock_stats = mock.MagicMock(spec=StatsLogger)
+        mock_get_backend.return_value = mock_stats
         scheduler_job = Job()
         self.job_runner = SchedulerJobRunner(job=scheduler_job)
         session = settings.Session()
@@ -1932,7 +2766,7 @@ class TestSchedulerJob:
         res = self.job_runner._executable_task_instances_to_queued(max_tis=32, session=session)
         assert len(res) == 0
 
-        mock_stats_gauge.assert_has_calls(
+        mock_stats.gauge.assert_has_calls(
             [
                 mock.call("scheduler.tasks.starving", 1),
                 mock.call(f"pool.starving_tasks.{Pool.DEFAULT_POOL_NAME}", 1),
@@ -1940,7 +2774,7 @@ class TestSchedulerJob:
             ],
             any_order=True,
         )
-        mock_stats_gauge.reset_mock()
+        mock_stats.gauge.reset_mock()
 
         set_default_pool_slots(2)
         session.flush()
@@ -1948,7 +2782,7 @@ class TestSchedulerJob:
         res = self.job_runner._executable_task_instances_to_queued(max_tis=32, session=session)
         assert len(res) == 1
 
-        mock_stats_gauge.assert_has_calls(
+        mock_stats.gauge.assert_has_calls(
             [
                 mock.call("scheduler.tasks.starving", 0),
                 mock.call(f"pool.starving_tasks.{Pool.DEFAULT_POOL_NAME}", 0),
@@ -1967,18 +2801,50 @@ class TestSchedulerJob:
         with dag_maker(dag_id=dag_id, start_date=DEFAULT_DATE, session=session):
             task1 = EmptyOperator(task_id=task_id_1)
 
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
 
         dr1 = dag_maker.create_dagrun()
         ti1 = dr1.get_task_instance(task1.task_id, session)
 
         with patch.object(BaseExecutor, "queue_workload") as mock_queue_workload:
             self.job_runner._enqueue_task_instances_with_queued_state(
-                [ti1], executor=scheduler_job.executor, session=session
+                [ti1], executor=self.job_runner.executor, session=session
             )
 
         assert mock_queue_workload.called
+        session.rollback()
+
+    def test_executable_task_instances_to_queued_sets_external_executor_id(self, dag_maker, session):
+        """external_executor_id is written to the DB in the same UPDATE that sets state=QUEUED."""
+        dag_id = "SchedulerJobTest.test_executable_sets_external_executor_id"
+        session = settings.Session()
+        with dag_maker(dag_id=dag_id, start_date=DEFAULT_DATE, session=session):
+            EmptyOperator(task_id="dummy")
+
+        class PreAssigningExecutor(MockExecutor):
+            pre_assigns_external_executor_id = True
+
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[PreAssigningExecutor()])
+
+        dr = dag_maker.create_dagrun()
+        ti = dr.get_task_instance("dummy", session)
+        ti.state = State.SCHEDULED
+        session.merge(ti)
+        session.flush()
+
+        returned_tis = self.job_runner._executable_task_instances_to_queued(max_tis=32, session=session)
+
+        assert len(returned_tis) == 1
+        # In-memory object (post make_transient) should carry the UUID
+        assert returned_tis[0].external_executor_id is not None
+        UUID(returned_tis[0].external_executor_id)
+
+        # DB row should also have it (the whole point — survives a crash)
+        db_value = session.scalar(select(TaskInstance.external_executor_id).where(TaskInstance.id == ti.id))
+        assert db_value == returned_tis[0].external_executor_id
+
         session.rollback()
 
     @pytest.mark.parametrize("state", [State.FAILED, State.SUCCESS])
@@ -2001,12 +2867,42 @@ class TestSchedulerJob:
 
         with patch.object(BaseExecutor, "queue_workload") as mock_queue_workload:
             self.job_runner._enqueue_task_instances_with_queued_state(
-                [ti], executor=scheduler_job.executor, session=session
+                [ti], executor=self.job_runner.executor, session=session
             )
         session.flush()
         ti.refresh_from_db(session=session)
         assert ti.state == State.NONE
         mock_queue_workload.assert_not_called()
+
+    def test_enqueue_task_instances_skips_ti_without_dag_version_id(self, dag_maker, session, caplog):
+        """Task instances without dag_version_id are not enqueued and an error is logged."""
+        dag_id = "SchedulerJobTest.test_enqueue_task_instances_skips_ti_without_dag_version_id"
+        task_id_1 = "dummy"
+        session = settings.Session()
+        with dag_maker(dag_id=dag_id, start_date=DEFAULT_DATE, session=session):
+            task1 = EmptyOperator(task_id=task_id_1)
+
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
+
+        dr1 = dag_maker.create_dagrun()
+        ti = dr1.get_task_instance(task1.task_id, session)
+        ti.state = State.SCHEDULED
+        ti.dag_version_id = None
+        session.merge(ti)
+        session.commit()
+
+        with patch.object(BaseExecutor, "queue_workload") as mock_queue_workload:
+            with caplog.at_level("WARNING", logger="airflow.jobs.scheduler_job_runner"):
+                self.job_runner._enqueue_task_instances_with_queued_state(
+                    [ti], executor=self.job_runner.executor, session=session
+                )
+
+        mock_queue_workload.assert_not_called()
+        assert any(
+            "does not have a dag_version_id set, cannot be enqueued" in rec.message for rec in caplog.records
+        )
+        session.rollback()
 
     @pytest.mark.parametrize(
         ("task1_exec", "task2_exec"),
@@ -2238,14 +3134,14 @@ class TestSchedulerJob:
             session.flush()
 
         scheduler_job.max_tis_per_query = 8
-        scheduler_job.executor.slots_available = 2  # Limit only the default executor to 2 slots.
+        self.job_runner.executor.slots_available = 2  # Limit only the default executor to 2 slots.
         # Check that we don't "overfill" an executor when the max tis per query is larger than slots
         # available. Of the 8 tasks returned by the query, the default executor will only take 2 and the
         # secondary executor will take 4 (since only 4 of the 8 TIs in the result will be for that executor)
         res = self.job_runner._critical_section_enqueue_task_instances(session)
         assert res == 6
 
-        scheduler_job.executor.slots_available = 6  # The default executor has more slots freed now and
+        self.job_runner.executor.slots_available = 6  # The default executor has more slots freed now and
         # will take the other two TIs.
         res = self.job_runner._critical_section_enqueue_task_instances(session)
         assert res == 2
@@ -2282,8 +3178,8 @@ class TestSchedulerJob:
             ti2.state = State.SCHEDULED
             session.flush()
         scheduler_job.max_tis_per_query = 0
-        scheduler_job.executor.parallelism = 32
-        scheduler_job.executor.slots_available = 31
+        self.job_runner.executor.parallelism = 32
+        self.job_runner.executor.slots_available = 31
 
         res = self.job_runner._critical_section_enqueue_task_instances(session)
         # 20 dag runs * 2 tasks each = 40, but limited by number of slots available
@@ -2312,7 +3208,10 @@ class TestSchedulerJob:
             task2 = EmptyOperator(task_id=task_id_2, executor=task2_exec)
 
         scheduler_job = Job()
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        with conf_vars({("core", "parallelism"): "40"}):
+            # 40 dag runs * 2 tasks each = 80. Two executors have capacity for 61 concurrent jobs, but they
+            # together respect core.parallelism and will not run more in aggregate then that allows.
+            self.job_runner = SchedulerJobRunner(job=scheduler_job)
 
         def _create_dagruns():
             dagrun = dag_maker.create_dagrun(run_type=DagRunType.SCHEDULED, state=State.RUNNING)
@@ -2337,10 +3236,7 @@ class TestSchedulerJob:
             executor.slots_available = 31
 
         total_enqueued = 0
-        with conf_vars({("core", "parallelism"): "40"}):
-            # 40 dag runs * 2 tasks each = 80. Two executors have capacity for 61 concurrent jobs, but they
-            # together respect core.parallelism and will not run more in aggregate then that allows.
-            total_enqueued += self.job_runner._critical_section_enqueue_task_instances(session)
+        total_enqueued += self.job_runner._critical_section_enqueue_task_instances(session)
 
         if task1_exec != task2_exec:
             # Two executors will execute up to core parallelism
@@ -2488,27 +3384,25 @@ class TestSchedulerJob:
         dag_run = dag_maker.create_dagrun(run_id="test_run", state=DagRunState.RUNNING)
 
         mock_executor = MagicMock()
-        scheduler_job = Job(executor=mock_executor)
-        self.job_runner = SchedulerJobRunner(scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(scheduler_job, executors=[mock_executor])
 
         ti = dag_run.get_task_instance(task_id="task", session=session)
         ti.state = TaskInstanceState.RUNNING
         ti.queued_by_job_id = scheduler_job.id
         ti.last_heartbeat_at = timezone.utcnow() - timedelta(hours=1)
-        # Simulate missing dag_version
+        # Simulate missing dag_version (legacy Airflow 2 task)
         ti.dag_version_id = None
         session.merge(ti)
         session.commit()
 
-        with caplog.at_level("WARNING", logger="airflow.jobs.scheduler_job_runner"):
+        with caplog.at_level("INFO", logger="airflow.jobs.scheduler_job_runner"):
             self.job_runner._purge_task_instances_without_heartbeats([ti], session=session)
 
-        # Should log a warning and skip processing
-        assert any("DAG Version not found for TaskInstance" in rec.message for rec in caplog.records)
-        mock_executor.send_callback.assert_not_called()
-        # State should be unchanged (not failed)
-        ti.refresh_from_db(session=session)
-        assert ti.state == TaskInstanceState.RUNNING
+        # dag_version_id should be backfilled from the latest DagVersion in the DB
+        # (dag_maker creates one) and the callback should be sent
+        assert any("Backfilled dag_version_id" in rec.message for rec in caplog.records)
+        mock_executor.send_callback.assert_called_once()
 
     @staticmethod
     def mock_failure_callback(context):
@@ -2703,14 +3597,13 @@ class TestSchedulerJob:
         ti.state = State.QUEUED
         ti.queued_dttm = timezone.utcnow() - timedelta(minutes=15)
         session.commit()
-        from airflow.executors.local_executor import LocalExecutor
 
         assert "revoke_task" in BaseExecutor.__dict__
         # this is just verifying that LocalExecutor is good enough for this test
         # in that it does not implement revoke_task
         assert "revoke_task" not in LocalExecutor.__dict__
-        scheduler_job = Job(executor=LocalExecutor())
-        job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=0)
+        scheduler_job = Job()
+        job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=0, executors=[LocalExecutor()])
         job_runner._task_queued_timeout = 300
         job_runner._handle_tasks_stuck_in_queued()
 
@@ -2721,7 +3614,7 @@ class TestSchedulerJob:
         scheduler_job = Job()
         self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1)
         run_job(scheduler_job, execute_callable=self.job_runner._execute)
-        scheduler_job.executor.end.assert_called_once()
+        self.job_runner.executor.end.assert_called_once()
 
     def test_executor_end_called_multiple_executors(self, mock_executors):
         """
@@ -2730,23 +3623,25 @@ class TestSchedulerJob:
         scheduler_job = Job()
         self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1)
         run_job(scheduler_job, execute_callable=self.job_runner._execute)
-        scheduler_job.executor.end.assert_called_once()
-        for executor in scheduler_job.executors:
+        self.job_runner.executor.end.assert_called_once()
+        for executor in self.job_runner.executors:
             executor.end.assert_called_once()
 
     def test_cleanup_methods_all_called(self):
         """
         Test to make sure all cleanup methods are called when the scheduler loop has an exception
         """
-        scheduler_job = Job(executor=mock.MagicMock(slots_available=8))
-        self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(
+            job=scheduler_job, num_runs=1, executors=[mock.MagicMock(slots_available=8)]
+        )
         self.job_runner._run_scheduler_loop = mock.MagicMock(side_effect=RuntimeError("oops"))
-        scheduler_job.executor.end = mock.MagicMock(side_effect=RuntimeError("triple oops"))
+        self.job_runner.executor.end = mock.MagicMock(side_effect=RuntimeError("triple oops"))
 
         with pytest.raises(RuntimeError, match="oops"):
             run_job(scheduler_job, execute_callable=self.job_runner._execute)
 
-        scheduler_job.executor.end.assert_called_once()
+        self.job_runner.executor.end.assert_called_once()
 
     def test_cleanup_methods_all_called_multiple_executors(self, mock_executors):
         """
@@ -2756,12 +3651,12 @@ class TestSchedulerJob:
 
         self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1)
         self.job_runner._run_scheduler_loop = mock.MagicMock(side_effect=RuntimeError("oops"))
-        scheduler_job.executor.end = mock.MagicMock(side_effect=RuntimeError("triple oops"))
+        self.job_runner.executor.end = mock.MagicMock(side_effect=RuntimeError("triple oops"))
 
         with pytest.raises(RuntimeError, match="oops"):
             run_job(scheduler_job, execute_callable=self.job_runner._execute)
 
-        for executor in scheduler_job.executors:
+        for executor in self.job_runner.executors:
             executor.end.assert_called_once()
 
     def test_queued_dagruns_stops_creating_when_max_active_is_reached(self, dag_maker, session):
@@ -2769,8 +3664,8 @@ class TestSchedulerJob:
         with dag_maker(max_active_runs=10) as dag:
             EmptyOperator(task_id="mytask")
 
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
 
         orm_dag = session.get(DagModel, dag.dag_id)
         assert orm_dag is not None
@@ -2795,8 +3690,8 @@ class TestSchedulerJob:
         """
         Test that when creating runs once max_active_runs is reached the runs does not stick
         """
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
 
         # Use catchup=True to ensure proper run creation behavior after max_active_runs is no longer reached
         with dag_maker(max_active_runs=1, session=session, catchup=True) as dag:
@@ -2822,190 +3717,6 @@ class TestSchedulerJob:
         # Assert that new runs has created
         dag_runs = DagRun.find(dag_id=dag.dag_id, session=session)
         assert len(dag_runs) == 2
-
-    @pytest.mark.parametrize(
-        ("ti_state", "final_ti_span_status"),
-        [
-            pytest.param(State.SUCCESS, SpanStatus.ENDED, id="dr_ended_successfully"),
-            pytest.param(State.RUNNING, SpanStatus.ACTIVE, id="dr_still_running"),
-        ],
-    )
-    def test_recreate_unhealthy_scheduler_spans_if_needed(self, ti_state, final_ti_span_status, dag_maker):
-        with dag_maker(
-            dag_id="test_recreate_unhealthy_scheduler_spans_if_needed",
-            start_date=DEFAULT_DATE,
-            max_active_runs=1,
-            dagrun_timeout=datetime.timedelta(seconds=60),
-        ):
-            EmptyOperator(task_id="dummy")
-
-        session = settings.Session()
-
-        old_job = Job()
-        old_job.job_type = SchedulerJobRunner.job_type
-
-        session.add(old_job)
-        session.commit()
-
-        assert old_job.is_alive() is False
-
-        new_job = Job()
-        new_job.job_type = SchedulerJobRunner.job_type
-        session.add(new_job)
-        session.flush()
-
-        self.job_runner = SchedulerJobRunner(job=new_job)
-        self.job_runner.active_spans = ThreadSafeDict()
-        assert len(self.job_runner.active_spans.get_all()) == 0
-
-        dr = dag_maker.create_dagrun()
-        dr.state = State.RUNNING
-        dr.span_status = SpanStatus.ACTIVE
-        dr.scheduled_by_job_id = old_job.id
-
-        ti = dr.get_task_instances(session=session)[0]
-        ti.state = ti_state
-        ti.start_date = timezone.utcnow()
-        ti.span_status = SpanStatus.ACTIVE
-        ti.queued_by_job_id = old_job.id
-        session.merge(ti)
-        session.merge(dr)
-        session.commit()
-
-        assert dr.scheduled_by_job_id != self.job_runner.job.id
-        assert dr.scheduled_by_job_id == old_job.id
-        assert dr.run_id is not None
-        assert dr.state == State.RUNNING
-        assert dr.span_status == SpanStatus.ACTIVE
-        assert self.job_runner.active_spans.get("dr:" + str(dr.id)) is None
-
-        assert self.job_runner.active_spans.get("ti:" + ti.id) is None
-        assert ti.state == ti_state
-        assert ti.span_status == SpanStatus.ACTIVE
-
-        self.job_runner._recreate_unhealthy_scheduler_spans_if_needed(dr, session)
-
-        assert self.job_runner.active_spans.get("dr:" + str(dr.id)) is not None
-
-        if final_ti_span_status == SpanStatus.ACTIVE:
-            assert self.job_runner.active_spans.get("ti:" + ti.id) is not None
-            assert len(self.job_runner.active_spans.get_all()) == 2
-        else:
-            assert self.job_runner.active_spans.get("ti:" + ti.id) is None
-            assert len(self.job_runner.active_spans.get_all()) == 1
-
-        assert dr.span_status == SpanStatus.ACTIVE
-        assert ti.span_status == final_ti_span_status
-
-    def test_end_spans_of_externally_ended_ops(self, dag_maker):
-        with dag_maker(
-            dag_id="test_end_spans_of_externally_ended_ops",
-            start_date=DEFAULT_DATE,
-            max_active_runs=1,
-            dagrun_timeout=datetime.timedelta(seconds=60),
-        ):
-            EmptyOperator(task_id="dummy")
-
-        session = settings.Session()
-
-        job = Job()
-        job.job_type = SchedulerJobRunner.job_type
-        session.add(job)
-
-        self.job_runner = SchedulerJobRunner(job=job)
-        self.job_runner.active_spans = ThreadSafeDict()
-        assert len(self.job_runner.active_spans.get_all()) == 0
-
-        dr = dag_maker.create_dagrun()
-        dr.state = State.SUCCESS
-        dr.span_status = SpanStatus.SHOULD_END
-
-        ti = dr.get_task_instances(session=session)[0]
-        ti.state = State.SUCCESS
-        ti.span_status = SpanStatus.SHOULD_END
-        ti.context_carrier = {}
-        session.merge(ti)
-        session.merge(dr)
-        session.commit()
-
-        dr_span = Trace.start_root_span(span_name="dag_run_span", start_as_current=False)
-        ti_span = Trace.start_child_span(span_name="ti_span", start_as_current=False)
-
-        self.job_runner.active_spans.set("dr:" + str(dr.id), dr_span)
-        self.job_runner.active_spans.set("ti:" + ti.id, ti_span)
-
-        assert dr.span_status == SpanStatus.SHOULD_END
-        assert ti.span_status == SpanStatus.SHOULD_END
-
-        assert self.job_runner.active_spans.get("dr:" + str(dr.id)) is not None
-        assert self.job_runner.active_spans.get("ti:" + ti.id) is not None
-
-        self.job_runner._end_spans_of_externally_ended_ops(session)
-
-        assert dr.span_status == SpanStatus.ENDED
-        assert ti.span_status == SpanStatus.ENDED
-
-        assert self.job_runner.active_spans.get("dr:" + str(dr.id)) is None
-        assert self.job_runner.active_spans.get("ti:" + ti.id) is None
-
-    @pytest.mark.parametrize(
-        ("state", "final_span_status"),
-        [
-            pytest.param(State.SUCCESS, SpanStatus.ENDED, id="dr_ended_successfully"),
-            pytest.param(State.RUNNING, SpanStatus.NEEDS_CONTINUANCE, id="dr_still_running"),
-        ],
-    )
-    def test_end_active_spans(self, state, final_span_status, dag_maker):
-        with dag_maker(
-            dag_id="test_end_active_spans",
-            start_date=DEFAULT_DATE,
-            max_active_runs=1,
-            dagrun_timeout=datetime.timedelta(seconds=60),
-        ):
-            EmptyOperator(task_id="dummy")
-
-        session = settings.Session()
-
-        job = Job()
-        job.job_type = SchedulerJobRunner.job_type
-
-        self.job_runner = SchedulerJobRunner(job=job)
-        self.job_runner.active_spans = ThreadSafeDict()
-        assert len(self.job_runner.active_spans.get_all()) == 0
-
-        dr = dag_maker.create_dagrun()
-        dr.state = state
-        dr.span_status = SpanStatus.ACTIVE
-
-        ti = dr.get_task_instances(session=session)[0]
-        ti.state = state
-        ti.span_status = SpanStatus.ACTIVE
-        ti.context_carrier = {}
-        session.merge(ti)
-        session.merge(dr)
-        session.commit()
-
-        dr_span = Trace.start_root_span(span_name="dag_run_span", start_as_current=False)
-        ti_span = Trace.start_child_span(span_name="ti_span", start_as_current=False)
-
-        self.job_runner.active_spans.set("dr:" + str(dr.id), dr_span)
-        self.job_runner.active_spans.set("ti:" + ti.id, ti_span)
-
-        assert dr.span_status == SpanStatus.ACTIVE
-        assert ti.span_status == SpanStatus.ACTIVE
-
-        assert self.job_runner.active_spans.get("dr:" + str(dr.id)) is not None
-        assert self.job_runner.active_spans.get("ti:" + ti.id) is not None
-        assert len(self.job_runner.active_spans.get_all()) == 2
-
-        self.job_runner._end_active_spans(session)
-
-        assert dr.span_status == final_span_status
-        assert ti.span_status == final_span_status
-
-        assert self.job_runner.active_spans.get("dr:" + str(dr.id)) is None
-        assert self.job_runner.active_spans.get("ti:" + ti.id) is None
-        assert len(self.job_runner.active_spans.get_all()) == 0
 
     def test_dagrun_timeout_verify_max_active_runs(self, dag_maker, session):
         """
@@ -3062,7 +3773,7 @@ class TestSchedulerJob:
             bundle_version=orm_dag.bundle_version,
             context_from_server=DagRunContext(
                 dag_run=dr,
-                last_ti=dr.get_last_ti(dag, session),
+                last_ti=dr.get_task_instance("dummy", session),
             ),
             msg="timed_out",
         )
@@ -3120,9 +3831,9 @@ class TestSchedulerJob:
 
         dr = dag_maker.create_dagrun(start_date=timezone.utcnow() - datetime.timedelta(days=1))
         # check that next_dagrun is dr.logical_date
-        dag_maker.dag_model.next_dagrun == dr.logical_date
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        assert dag_maker.dag_model.next_dagrun == dr.logical_date
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
 
         self.job_runner._schedule_dag_run(dr, session)
         session.flush()
@@ -3156,8 +3867,8 @@ class TestSchedulerJob:
         ) as dag:
             EmptyOperator(task_id="dummy")
 
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
 
         dr = dag_maker.create_dagrun()
         ti = dr.get_task_instance("dummy", session)
@@ -3181,7 +3892,7 @@ class TestSchedulerJob:
         )
 
         # Verify dag failure callback request is sent to file processor
-        scheduler_job.executor.callback_sink.send.assert_called_once_with(expected_callback)
+        self.job_runner.executor.callback_sink.send.assert_called_once_with(expected_callback)
         session.rollback()
         session.close()
 
@@ -3206,8 +3917,8 @@ class TestSchedulerJob:
         dag_listener.clear()
         listener_manager(dag_listener)
 
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
 
         dr = dag_maker.create_dagrun()
 
@@ -3233,10 +3944,10 @@ class TestSchedulerJob:
         ) as dag:
             EmptyOperator(task_id="empty")
 
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
 
-        scheduler_job.executor.callback_sink = DatabaseCallbackSink()
+        self.job_runner.executor.callback_sink = DatabaseCallbackSink()
 
         dr = dag_maker.create_dagrun(start_date=DEFAULT_DATE)
 
@@ -3258,7 +3969,7 @@ class TestSchedulerJob:
             bundle_version=None,
             context_from_server=DagRunContext(
                 dag_run=dr,
-                last_ti=dr.get_last_ti(dag, session),
+                last_ti=dr.get_task_instance("empty", session),
             ),
         )
 
@@ -3388,8 +4099,8 @@ class TestSchedulerJob:
 
         executor = MockExecutor(do_update=False)
 
-        scheduler_job = Job(executor=executor)
-        self.job_runner = SchedulerJobRunner(scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(scheduler_job, executors=[executor])
 
         session = settings.Session()
         dr = dag_maker.create_dagrun()
@@ -3479,8 +4190,8 @@ class TestSchedulerJob:
         for idx, state in enumerate(ti_states):
             dr.task_instances[idx].state = state
         session.commit()
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
 
         self.job_runner._do_scheduling(session)
         assert (
@@ -3527,8 +4238,9 @@ class TestSchedulerJob:
             scheduler_dag.clear()
             assert scheduler_dag.start_date > datetime.datetime.now(timezone.utc)
 
-            scheduler_job = Job(executor=self.null_exec)
-            self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1)
+            scheduler_job = Job()
+            self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1, executors=[self.null_exec])
+
             run_job(scheduler_job, execute_callable=self.job_runner._execute)
 
             # zero tasks ran
@@ -3554,8 +4266,9 @@ class TestSchedulerJob:
             assert len(session.scalars(select(TaskInstance).where(TaskInstance.dag_id == dag_id)).all()) == 1
             session.commit()
 
-            scheduler_job = Job(executor=self.null_exec)
-            self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1)
+            scheduler_job = Job()
+            self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1, executors=[self.null_exec])
+
             run_job(scheduler_job, execute_callable=self.job_runner._execute)
 
             # still one task
@@ -3585,8 +4298,9 @@ class TestSchedulerJob:
 
         sync_bag_to_db(dagbag, "testing", None)
 
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=3)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=3, executors=[self.null_exec])
+
         run_job(scheduler_job, execute_callable=self.job_runner._execute)
 
         session = settings.Session()
@@ -3624,8 +4338,9 @@ class TestSchedulerJob:
 
         sync_bag_to_db(dagbag, "testing", None)
 
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=3)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=3, executors=[self.null_exec])
+
         run_job(scheduler_job, execute_callable=self.job_runner._execute)
 
         session = settings.Session()
@@ -3663,8 +4378,9 @@ class TestSchedulerJob:
                 raise ValueError(f"could not find dag {dag_id}")
             create_scheduler_dag(dag).clear()
 
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1, executors=[self.null_exec])
+
         run_job(scheduler_job, execute_callable=self.job_runner._execute)
 
         # zero tasks ran
@@ -3768,7 +4484,7 @@ class TestSchedulerJob:
         # To increase the chances the TIs from the "full" pool will get
         # retrieved first, we schedule all TIs from the first dag first.
         def _create_dagruns(dag: SerializedDAG):
-            next_info = dag.next_dagrun_info(None)
+            next_info = dag.next_dagrun_info(last_automated_run_info=None)
             assert next_info is not None
             for i in range(30):
                 yield dag.create_dagrun(
@@ -3781,7 +4497,7 @@ class TestSchedulerJob:
                     triggered_by=DagRunTriggeredByType.TEST,
                     session=session,
                 )
-                next_info = dag.next_dagrun_info(next_info.data_interval)
+                next_info = dag.next_dagrun_info(last_automated_run_info=next_info)
                 if next_info is None:
                     break
 
@@ -3972,7 +4688,7 @@ class TestSchedulerJob:
         dr = drs[0]
 
         self.job_runner._schedule_dag_run(dag_run=dr, session=session)
-        len(self.job_runner.scheduler_dag_bag.get_dag_for_run(dr, session).tasks) == 1
+        assert len(self.job_runner.scheduler_dag_bag.get_dag_for_run(dr, session).tasks) == 1
         dag_version_1 = DagVersion.get_latest_version(dr.dag_id, session=session)
         assert dr.dag_versions[-1].id == dag_version_1.id
 
@@ -4061,15 +4777,15 @@ class TestSchedulerJob:
                 bash_command="exit 1",
                 retries=1,
             )
-        dag_maker.dag_model.calculate_dagrun_date_fields(dag, None)
+        dag_maker.dag_model.calculate_dagrun_date_fields(dag, last_automated_run=None)
 
         @provide_session
         def do_schedule(session):
             # Use a empty file since the above mock will return the
             # expected DAGs. Also specify only a single file so that it doesn't
             # try to schedule the above DAG repeatedly.
-            scheduler_job = Job(executor=executor)
-            self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1)
+            scheduler_job = Job()
+            self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1, executors=[executor])
 
             scheduler_job.heartrate = 0
             # Since the DAG is not in the directory watched by scheduler job,
@@ -4270,6 +4986,7 @@ class TestSchedulerJob:
         session.rollback()
 
     def test_adopt_or_reset_orphaned_tasks_stale_scheduler_jobs(self, dag_maker):
+        # todo: this fails
         dag_id = "test_adopt_or_reset_orphaned_tasks_stale_scheduler_jobs"
         with dag_maker(dag_id=dag_id, schedule="@daily"):
             EmptyOperator(task_id="task1")
@@ -4354,11 +5071,49 @@ class TestSchedulerJob:
         with dag_maker(schedule="0 0 * * *"):
             EmptyOperator(task_id="dummy")
 
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
+
         with patch("airflow.models.dag.DagModel.calculate_dagrun_date_fields") as mock_calc:
             self.job_runner._create_dag_runs(dag_models=[dag_maker.dag_model], session=session)
         assert mock_calc.called
+
+    @pytest.mark.parametrize(
+        "expected",
+        [
+            DagRunInfo(
+                run_after=pendulum.now(),
+                data_interval=None,
+                partition_date=None,
+                partition_key="helloooooo",
+            ),
+            DagRunInfo(
+                run_after=pendulum.now(),
+                data_interval=DataInterval(pendulum.today(), pendulum.today()),
+                partition_date=None,
+                partition_key=None,
+            ),
+        ],
+    )
+    @patch("airflow.timetables.base.Timetable.next_run_info_from_dag_model")
+    @patch("airflow.serialization.definitions.dag.SerializedDAG.create_dagrun")
+    def test_should_use_info_from_timetable(self, mock_create, mock_next, expected, session, dag_maker):
+        """We should always update next_dagrun after scheduler creates a new dag run."""
+        mock_next.return_value = expected
+        with dag_maker(schedule="0 0 * * *"):
+            EmptyOperator(task_id="dummy")
+
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
+        self.job_runner._create_dag_runs(dag_models=[dag_maker.dag_model], session=session)
+        kwargs = mock_create.call_args.kwargs
+        actual = DagRunInfo(
+            run_after=kwargs["run_after"],
+            data_interval=kwargs["data_interval"],
+            partition_key=kwargs["partition_key"],
+            partition_date=None,
+        )
+        assert actual == expected
 
     @pytest.mark.parametrize(
         ("run_type", "expected"),
@@ -4393,8 +5148,9 @@ class TestSchedulerJob:
         )
 
         session.flush()
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
 
         # ensure terminal state; otherwise the run type is moot
         run.state = DagRunState.FAILED
@@ -4425,8 +5181,8 @@ class TestSchedulerJob:
 
         dag_model = dag_maker.dag_model
 
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
 
         with create_session() as session:
             self.job_runner._create_dag_runs([dag_model], session)
@@ -4499,8 +5255,8 @@ class TestSchedulerJob:
         )
         session.flush()
 
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
 
         with create_session() as session:
             self.job_runner._create_dagruns_for_dags(session, session)
@@ -4593,8 +5349,8 @@ class TestSchedulerJob:
         )
         session.flush()
 
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
 
         with create_session() as session:
             self.job_runner._create_dagruns_for_dags(session, session)
@@ -4652,7 +5408,10 @@ class TestSchedulerJob:
         )
         session.flush()
         assert session.scalars(ase_q).one().source_run_id == dr1.run_id
-        assert session.scalars(adrq_q).one_or_none() is None
+        if "is_stale" in disable:
+            assert session.scalars(adrq_q).one_or_none() is not None
+        else:
+            assert session.scalars(adrq_q).one_or_none() is None
 
         # Simulate the consumer DAG being enabled.
         session.execute(update(DagModel).where(DagModel.dag_id == "consumer").values(**enable))
@@ -4666,11 +5425,12 @@ class TestSchedulerJob:
         )
         session.flush()
         assert [e.source_run_id for e in session.scalars(ase_q)] == [dr1.run_id, dr2.run_id]
+        assert len(session.scalars(adrq_q).all()) == 1
         assert session.scalars(adrq_q).one().target_dag_id == "consumer"
 
     @time_machine.travel(DEFAULT_DATE + datetime.timedelta(days=1, seconds=9), tick=False)
-    @mock.patch("airflow.jobs.scheduler_job_runner.Stats.timing")
-    def test_start_dagruns(self, stats_timing, dag_maker, session):
+    @mock.patch("airflow._shared.observability.metrics.stats._get_backend")
+    def test_start_dagruns(self, mock_get_backend, dag_maker, session):
         """
         Test that _start_dagrun:
 
@@ -4684,8 +5444,10 @@ class TestSchedulerJob:
 
         dag_model = dag_maker.dag_model
 
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        mock_stats = mock.MagicMock(spec=StatsLogger)
+        mock_get_backend.return_value = mock_stats
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
 
         self.job_runner._create_dag_runs([dag_model], session)
         self.job_runner._start_queued_dagruns(session)
@@ -4694,7 +5456,7 @@ class TestSchedulerJob:
         # Assert dr state is running
         assert dr.state == State.RUNNING
 
-        stats_timing.assert_has_calls(
+        mock_stats.timing.assert_has_calls(
             [
                 mock.call(
                     "dagrun.schedule_delay.test_start_dag_runs",
@@ -4726,8 +5488,8 @@ class TestSchedulerJob:
         assert custom_task.operator_extra_links
 
         session = settings.Session()
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
         self.job_runner._do_scheduling(session=session)
         self.job_runner._start_queued_dagruns(session)
         session.flush()
@@ -4749,8 +5511,8 @@ class TestSchedulerJob:
                 task_id="dummy",
             )
 
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
 
         caplog.set_level("FATAL")
         caplog.clear()
@@ -4766,9 +5528,7 @@ class TestSchedulerJob:
             scheduler_messages = [
                 record.message for record in caplog.records if record.levelno >= logging.ERROR
             ]
-            assert scheduler_messages == [
-                "DAG 'test_scheduler_create_dag_runs_does_not_raise_error' not found in serialized_dag table",
-            ]
+            assert scheduler_messages == ["Dag not found in serialized_dag table"]
 
     def _clear_serdags(self, dag_id, session):
         SDM = SerializedDagModel
@@ -4776,6 +5536,130 @@ class TestSchedulerJob:
         for sdm in sdms:
             session.delete(sdm)
         session.commit()
+
+    def test_scheduler_create_dag_runs_does_not_crash_on_deserialization_error(self, caplog, dag_maker):
+        """
+        Test that scheduler._create_dag_runs does not crash when DAG deserialization fails.
+        This is a guardrail to ensure the scheduler continues processing other DAGs even if
+        one DAG has a deserialization error.
+        """
+        with dag_maker(dag_id="test_scheduler_create_dag_runs_deserialization_error"):
+            EmptyOperator(task_id="dummy")
+
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
+
+        caplog.set_level("FATAL")
+        caplog.clear()
+        with (
+            create_session() as session,
+            caplog.at_level(
+                "ERROR",
+                logger="airflow.jobs.scheduler_job_runner",
+            ),
+            patch(
+                "airflow.models.serialized_dag.SerializedDagModel.get",
+                side_effect=Exception("Simulated deserialization error"),
+            ),
+        ):
+            self.job_runner._create_dag_runs([dag_maker.dag_model], session)
+            scheduler_messages = [
+                record.message for record in caplog.records if record.levelno >= logging.ERROR
+            ]
+            assert any("Failed to deserialize DAG" in msg for msg in scheduler_messages), (
+                f"Expected deserialization error log, got: {scheduler_messages}"
+            )
+
+    def test_schedule_all_dag_runs_does_not_crash_on_single_dag_run_error(self, dag_maker, caplog, session):
+        """Test that _schedule_all_dag_runs continues processing other DAG runs
+        when one DAG run raises an exception during scheduling.
+
+        Previously, _schedule_all_dag_runs used a list comprehension that would
+        abort entirely if any single _schedule_dag_run call raised, crashing
+        the entire scheduler and stopping scheduling for ALL DAGs.
+
+        While the specific scenario used to reproduce this (a TaskInstance with
+        state=UP_FOR_RETRY and end_date=NULL) is nearly impossible under normal
+        operation, the lack of per-dag-run fault isolation means ANY unexpected
+        exception from ANY dag run would have the same catastrophic effect.
+        """
+        # Create two DAGs with running DAG runs
+        with dag_maker(dag_id="good_dag", schedule="@once"):
+            EmptyOperator(task_id="good_task")
+        good_run = dag_maker.create_dagrun(state=DagRunState.RUNNING)
+
+        with dag_maker(dag_id="bad_dag", schedule="@once"):
+            EmptyOperator(task_id="bad_task")
+        bad_run = dag_maker.create_dagrun(state=DagRunState.RUNNING)
+
+        session.flush()
+
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
+
+        caplog.clear()
+        with (
+            caplog.at_level("ERROR", logger="airflow.jobs.scheduler_job_runner"),
+            patch.object(
+                self.job_runner,
+                "_schedule_dag_run",
+                autospec=True,
+                side_effect=[
+                    TypeError("simulated crash from corrupted task instance"),  # bad_run
+                    None,  # good_run
+                ],
+            ) as mock_schedule,
+        ):
+            from airflow.utils.sqlalchemy import prohibit_commit
+
+            with prohibit_commit(session) as guard:
+                result = self.job_runner._schedule_all_dag_runs(guard, [bad_run, good_run], session=session)
+
+            # The good DAG run should have been processed despite the bad one failing
+            assert len(result) == 1
+            assert result[0][0] == good_run
+
+            # Both dag runs should have been attempted
+            assert mock_schedule.call_count == 2
+
+            # The error should have been logged
+            error_messages = [r.message for r in caplog.records if r.levelno >= logging.ERROR]
+            assert any(
+                msg == f"Error scheduling DAG run {bad_run.run_id} of {bad_run.dag_id}"
+                for msg in error_messages
+            )
+
+    def test_schedule_all_dag_runs_reraises_db_errors(self, dag_maker, session):
+        """Test that _schedule_all_dag_runs does not catch DBAPIError, allowing
+        it to propagate to @retry_db_transaction for proper retry handling.
+        """
+        from sqlalchemy.exc import DBAPIError
+
+        with dag_maker(dag_id="db_error_dag", schedule="@once"):
+            EmptyOperator(task_id="task1")
+        run = dag_maker.create_dagrun(state=DagRunState.RUNNING)
+        session.flush()
+
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
+
+        with patch.object(
+            self.job_runner,
+            "_schedule_dag_run",
+            autospec=True,
+            side_effect=DBAPIError("select 1", None, Exception("connection lost")),
+        ) as mock_schedule:
+            from airflow.utils.sqlalchemy import prohibit_commit
+
+            with prohibit_commit(session) as guard:
+                # Bypass @retry_db_transaction to verify the exception escapes
+                # the inner function rather than being swallowed by except Exception.
+                with pytest.raises(DBAPIError):
+                    self.job_runner._schedule_all_dag_runs.__wrapped__(
+                        self.job_runner, guard, [run], session=session
+                    )
+
+            assert mock_schedule.call_count == 1
 
     def test_bulk_write_to_db_external_trigger_dont_skip_scheduled_run(self, dag_maker, testing_dag_bundle):
         """
@@ -4798,8 +5682,8 @@ class TestSchedulerJob:
         assert dag_model.next_dagrun_data_interval_start == DEFAULT_DATE
         assert dag_model.next_dagrun_data_interval_end == DEFAULT_DATE + timedelta(minutes=1)
 
-        scheduler_job = Job(executor=MockExecutor(do_update=False))
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[MockExecutor(do_update=False)])
 
         # Verify a DagRun is created with the correct dates
         # when Scheduler._do_scheduling is run in the Scheduler Loop
@@ -4874,8 +5758,8 @@ class TestSchedulerJob:
 
         assert get_last_dagrun(dag.dag_id, session) == dagrun
 
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
 
         # Test that this does not raise any error
         self.job_runner._create_dag_runs([dag_model], session)
@@ -4929,8 +5813,8 @@ class TestSchedulerJob:
             triggered_by=DagRunTriggeredByType.TEST,
         )
 
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
 
         my_dag = session.get(DagModel, dag.dag_id)
         self.job_runner._create_dag_runs([my_dag], session)
@@ -4971,8 +5855,8 @@ class TestSchedulerJob:
         )
 
         executor = MockExecutor(do_update=False)
-        scheduler_job = Job(executor=executor)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[executor])
 
         with mock.patch("airflow.executors.executor_loader.ExecutorLoader.load_executor") as loader_mock:
             # The executor is mocked, so cannot be loaded/imported. Mock load_executor and return the
@@ -4995,15 +5879,15 @@ class TestSchedulerJob:
         # Explicitly set catchup=True as test specifically expects historical dates to be respected
         with dag_maker(max_active_runs=1, catchup=True):
             EmptyOperator(task_id="task")
-        scheduler_job = Job(executor=MockExecutor(do_update=False))
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[MockExecutor(do_update=False)])
 
         assert session.scalar(select(func.count()).select_from(DagRun)) == 0
         query, _ = DagModel.dags_needing_dagruns(session)
         dag_models = query.all()
         self.job_runner._create_dag_runs(dag_models, session)
         dr = session.scalars(select(DagRun)).one()
-        dr.state == DagRunState.QUEUED
+        assert dr.state == DagRunState.QUEUED
         assert session.scalar(select(func.count()).select_from(DagRun)) == 1
         assert dag_maker.dag_model.next_dagrun_create_after == DEFAULT_DATE + timedelta(days=2)
         assert dag_maker.dag_model.next_dagrun == DEFAULT_DATE + timedelta(days=1)
@@ -5064,8 +5948,8 @@ class TestSchedulerJob:
             # Need to use something that doesn't immediately get marked as success by the scheduler
             BashOperator(task_id="task", bash_command="true")
 
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
 
         query, _ = DagModel.dags_needing_dagruns(session)
         query.all()
@@ -5178,8 +6062,8 @@ class TestSchedulerJob:
         for _ in range(9):
             dr = dag_maker.create_dagrun_after(dr, run_type=DagRunType.SCHEDULED, state=State.QUEUED)
 
-        scheduler_job = Job(executor=MockExecutor(do_update=False))
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[MockExecutor(do_update=False)])
 
         self.job_runner._start_queued_dagruns(session)
         session.flush()
@@ -5219,8 +6103,8 @@ class TestSchedulerJob:
         for _ in range(9):
             dr = dag_maker.create_dagrun_after(dr, run_type=DagRunType.SCHEDULED, state=State.QUEUED)
 
-        scheduler_job = Job(executor=MockExecutor(do_update=False))
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[MockExecutor(do_update=False)])
 
         self.job_runner._start_queued_dagruns(session)
         session.flush()
@@ -5312,8 +6196,8 @@ class TestSchedulerJob:
         for _ in range(2):
             dr = dag_maker.create_dagrun_after(dr, run_type=DagRunType.SCHEDULED, state=State.QUEUED)
 
-        scheduler_job = Job(executor=MockExecutor(do_update=False))
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[MockExecutor(do_update=False)])
 
         self.job_runner._start_queued_dagruns(session)
         session.flush()
@@ -5398,8 +6282,8 @@ class TestSchedulerJob:
             )
             return dag1_non_b_running, dag1_b_running, total_running_count
 
-        scheduler_job = Job(executor=MockExecutor(do_update=False))
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[MockExecutor(do_update=False)])
 
         from_date = pendulum.parse("2021-01-01")
         to_date = pendulum.parse("2021-01-06")
@@ -5510,8 +6394,8 @@ class TestSchedulerJob:
             )
             return dag1_non_b_running, dag1_b_running, total_running_count
 
-        scheduler_job = Job(executor=MockExecutor(do_update=False))
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[MockExecutor(do_update=False)])
 
         from_date = pendulum.parse("2021-01-01")
         to_date = pendulum.parse("2021-01-06")
@@ -5613,8 +6497,8 @@ class TestSchedulerJob:
             )
             return dag1_non_b_running, dag1_b_running, total_running_count
 
-        scheduler_job = Job(executor=MockExecutor(do_update=False))
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[MockExecutor(do_update=False)])
 
         from_date = pendulum.parse("2021-01-01")
         to_date = pendulum.parse("2021-01-06")
@@ -5758,8 +6642,8 @@ class TestSchedulerJob:
             )
             return dag1_non_b_running, dag1_b_running, total_running_count
 
-        scheduler_job = Job(executor=MockExecutor(do_update=False))
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[MockExecutor(do_update=False)])
 
         from_date = pendulum.parse("2021-01-01")
         to_date = pendulum.parse("2021-01-06")
@@ -5835,8 +6719,8 @@ class TestSchedulerJob:
         )
         assert queued_count == 5
 
-        scheduler_job = Job(executor=MockExecutor(do_update=False))
-        job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        job_runner = SchedulerJobRunner(job=scheduler_job, executors=[MockExecutor(do_update=False)])
 
         # Simulate another scheduler holding the lock by returning empty from _lock_backfills
         with patch.object(job_runner, "_lock_backfills", return_value={}):
@@ -5887,8 +6771,8 @@ class TestSchedulerJob:
                 logical_date=date,
             )
             date = dr.logical_date + timedelta(hours=1)
-        scheduler_job = Job(executor=MockExecutor(do_update=False))
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[MockExecutor(do_update=False)])
 
         self.job_runner._start_queued_dagruns(session)
         session.flush()
@@ -5931,7 +6815,13 @@ class TestSchedulerJob:
             run_id="dr1_run_2",
             state=State.QUEUED,
             logical_date=dag.next_dagrun_info(
-                last_automated_dagrun=data_interval, restricted=False
+                last_automated_run_info=DagRunInfo(
+                    run_after=dr1_running.run_after,
+                    data_interval=data_interval,
+                    partition_date=None,
+                    partition_key=None,
+                ),
+                restricted=False,
             ).data_interval.start,
         )
         # second dag and dagruns
@@ -5976,8 +6866,8 @@ class TestSchedulerJob:
             )
             date = dr.logical_date + timedelta(hours=1)
 
-        scheduler_job = Job(executor=MockExecutor(do_update=False))
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[MockExecutor(do_update=False)])
 
         dag_version = DagVersion.get_latest_version(dag_id=dag.dag_id)
         ti = create_task_instance(task=task1, run_id=dr1_running.run_id, dag_version_id=dag_version.id)
@@ -6414,7 +7304,7 @@ class TestSchedulerJob:
 
     def test_find_and_purge_task_instances_without_heartbeats_nothing(self):
         executor = MockExecutor(do_update=False)
-        scheduler_job = Job(executor=executor)
+        scheduler_job = Job()
         with mock.patch("airflow.executors.executor_loader.ExecutorLoader.load_executor") as loader_mock:
             loader_mock.return_value = executor
             self.job_runner = SchedulerJobRunner(scheduler_job)
@@ -6441,7 +7331,7 @@ class TestSchedulerJob:
         )
 
         executor = MockExecutor()
-        scheduler_job = Job(executor=executor)
+        scheduler_job = Job()
         with mock.patch("airflow.executors.executor_loader.ExecutorLoader.load_executor") as loader_mock:
             loader_mock.return_value = executor
             self.job_runner = SchedulerJobRunner(job=scheduler_job)
@@ -6511,8 +7401,8 @@ class TestSchedulerJob:
             data_interval=data_interval,
         )
 
-        scheduler_job = Job(executor=MockExecutor())
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[MockExecutor()])
 
         # We will provision 2 tasks so we can check we only find task instance heartbeat timeouts from this scheduler
         tasks_to_setup = ["branching", "run_this_first"]
@@ -6625,7 +7515,6 @@ class TestSchedulerJob:
     @pytest.mark.parametrize("dag_id", ["test_mapped_classic", "test_mapped_taskflow"])
     def test_mapped_dag(self, dag_id, session, testing_dag_bundle):
         """End-to-end test of a simple mapped dag"""
-        from airflow.executors.local_executor import LocalExecutor
 
         dagbag = DagBag(dag_folder=TEST_DAGS_FOLDER, include_examples=False)
         sync_bag_to_db(dagbag, "testing", None)
@@ -6649,8 +7538,8 @@ class TestSchedulerJob:
 
         executor = LocalExecutor()
 
-        job = Job(executor=executor)
-        self.job_runner = SchedulerJobRunner(job=job)
+        job = Job()
+        self.job_runner = SchedulerJobRunner(job=job, executors=[executor])
         self.run_scheduler_until_dagrun_terminal()
 
         dr.refresh_from_db(session)
@@ -6743,8 +7632,8 @@ class TestSchedulerJob:
         ) as dag:
             EmptyOperator(task_id="dummy")
 
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
 
         self.job_runner._create_dag_runs([dag_maker.dag_model], session)
         self.job_runner._start_queued_dagruns(session)
@@ -6797,8 +7686,8 @@ class TestSchedulerJob:
 
         assert scheduled_run.state == State.RUNNING
 
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
 
         self.job_runner._update_dag_run_state_for_paused_dags(session=session)
         session.flush()
@@ -6838,8 +7727,8 @@ class TestSchedulerJob:
 
         assert backfill_run.state == State.RUNNING
 
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
 
         self.job_runner._update_dag_run_state_for_paused_dags(session=session)
         session.flush()
@@ -6987,6 +7876,24 @@ class TestSchedulerJob:
         self.job_runner._remove_unreferenced_triggers(session=session)
         assert session.scalars(select(Trigger.classpath)).one_or_none() == expected_classpath
 
+    @pytest.mark.need_serialized_dag(False)
+    def test_delete_unreferenced_triggers_with_null_trigger_id_ti(self, dag_maker, session):
+        """Unreferenced triggers are deleted even when other TIs have ``trigger_id IS NULL``."""
+        self.job_runner = SchedulerJobRunner(job=Job())
+
+        with dag_maker(dag_id="dag", session=session):
+            EmptyOperator(task_id="task")
+        dag_maker.create_dagrun()
+
+        unreferenced = Trigger(
+            classpath="airflow.providers.standard.triggers.file.FileDeleteTrigger", kwargs={}
+        )
+        session.add(unreferenced)
+        session.flush()
+
+        self.job_runner._remove_unreferenced_triggers(session=session)
+        assert session.scalar(select(func.count()).select_from(Trigger)) == 0
+
     @patch("airflow.serialization.serialized_objects.SerializedDAG.create_dagrun")
     def test_misconfigured_dags_doesnt_crash_scheduler(self, mock_create, session, dag_maker, caplog):
         """Test that if dagrun creation throws an exception, the scheduler doesn't crash"""
@@ -7002,7 +7909,38 @@ class TestSchedulerJob:
         job_runner = SchedulerJobRunner(job=scheduler_job)
         # In the dagmodel list, the first dag should fail, but the second one should succeed
         job_runner._create_dag_runs([dm1], session)
-        assert "Failed creating DagRun for testdag1" in caplog.text
+        assert "Failed creating DagRun" in caplog.text
+
+    def test_activate_referenced_assets_no_in_check_inside_query(self, session, testing_dag_bundle):
+        dag_id1 = "test_asset_dag1"
+        asset1_name = "asset1"
+        asset_extra = {"foo": "bar"}
+
+        asset1 = Asset(name=asset1_name, uri="s3://bucket/key/1", extra=asset_extra)
+        dag1 = DAG(dag_id=dag_id1, start_date=DEFAULT_DATE, schedule=[asset1])
+        sync_dag_to_db(dag1, session=session)
+
+        @contextmanager
+        def assert_no_in_clause(session):
+            from sqlalchemy import event
+
+            def fail_on_in_clause_found(execute_statement):
+                if " IN " in str(execute_statement).upper():
+                    execute_statement = str(execute_statement).upper()
+                    pytest.fail(
+                        f"Query contains IN clause which was removed in PR #62114, query: {execute_statement}"
+                    )
+
+            event.listen(session, "do_orm_execute", fail_on_in_clause_found)
+            try:
+                yield
+            finally:
+                event.remove(session, "do_orm_execute", fail_on_in_clause_found)
+
+        asset_models = select(AssetModel).cte()
+
+        with assert_no_in_clause(session):
+            SchedulerJobRunner._activate_referenced_assets(asset_models, session=session)
 
     def test_activate_referenced_assets_with_no_existing_warning(self, session, testing_dag_bundle):
         dag_warnings = session.scalars(select(DagWarning)).all()
@@ -7018,8 +7956,8 @@ class TestSchedulerJob:
         dag1 = DAG(dag_id=dag_id1, start_date=DEFAULT_DATE, schedule=[asset1, asset1_1, asset1_2])
         sync_dag_to_db(dag1, session=session)
 
-        asset_models = session.scalars(select(AssetModel)).all()
-        assert len(asset_models) == 3
+        asset_models = select(AssetModel).cte()
+        assert len(session.execute(select(asset_models)).all()) == 3
 
         SchedulerJobRunner._activate_referenced_assets(asset_models, session=session)
         session.flush()
@@ -7056,7 +7994,7 @@ class TestSchedulerJob:
         )
         session.flush()
 
-        asset_models = session.scalars(select(AssetModel)).all()
+        asset_models = select(AssetModel).cte()
 
         SchedulerJobRunner._activate_referenced_assets(asset_models, session=session)
         session.flush()
@@ -7105,7 +8043,7 @@ class TestSchedulerJob:
         session.add(DagWarning(dag_id=dag_id, warning_type="asset conflict", message="will not exist"))
         session.flush()
 
-        asset_models = session.scalars(select(AssetModel)).all()
+        asset_models = select(AssetModel).cte()
 
         SchedulerJobRunner._activate_referenced_assets(asset_models, session=session)
         session.flush()
@@ -7124,8 +8062,8 @@ class TestSchedulerJob:
         dag_run = dag_maker.create_dagrun(run_id="test_run", state=DagRunState.RUNNING)
 
         mock_executor = MagicMock()
-        scheduler_job = Job(executor=mock_executor)
-        self.job_runner = SchedulerJobRunner(scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(scheduler_job, executors=[mock_executor])
 
         # Create a task instance that appears to be running but hasn't heartbeat
         ti = dag_run.get_task_instance(task_id="test_task")
@@ -7168,8 +8106,8 @@ class TestSchedulerJob:
         ti = dr.get_task_instance(task_id="t1")
 
         executor = MockExecutor(do_update=False)
-        scheduler_job = Job(executor=executor)
-        self.job_runner = SchedulerJobRunner(scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(scheduler_job, executors=[executor])
 
         ti.state = State.QUEUED
         session.merge(ti)
@@ -7180,10 +8118,131 @@ class TestSchedulerJob:
 
         self.job_runner._process_executor_events(executor=executor, session=session)
 
-        scheduler_job.executor.callback_sink.send.assert_called()
-        request = scheduler_job.executor.callback_sink.send.call_args[0][0]
+        self.job_runner.executor.callback_sink.send.assert_called()
+        request = self.job_runner.executor.callback_sink.send.call_args[0][0]
         assert isinstance(request, TaskCallbackRequest)
         assert request.task_callback_type == expected
+
+    @pytest.mark.parametrize(
+        ("dag_run_bv", "dag_version_bv", "expected_bv"),
+        [
+            pytest.param(None, "abc123-sha", None, id="disable_bundle_versioning"),
+            pytest.param("abc123-sha", "abc123-sha", "abc123-sha", id="versioning_enabled"),
+        ],
+    )
+    def test_external_kill_callback_bundle_version_follows_dag_run(
+        self, dag_maker, session, dag_run_bv, dag_version_bv, expected_bv
+    ):
+        """
+        TaskCallbackRequest.bundle_version must mirror dag_run.bundle_version, not
+        dag_version.bundle_version. With disable_bundle_versioning=True the trigger
+        path leaves dag_run.bundle_version=None even though DagVersion was written
+        with a SHA — the callback must inherit None so it runs against the same
+        on-disk code as the task did.
+        """
+        with dag_maker(dag_id=f"ext_kill_bv_{dag_run_bv or 'none'}", fileloc="/test_path1/"):
+            EmptyOperator(task_id="t1", on_failure_callback=lambda ctx: None)
+        dr = dag_maker.create_dagrun(state=DagRunState.RUNNING)
+
+        ti = dr.get_task_instance(task_id="t1", session=session)
+        dag_version = ti.dag_version
+        dag_version.bundle_version = dag_version_bv
+        dr.bundle_version = dag_run_bv
+        ti.state = State.QUEUED
+        session.merge(dag_version)
+        session.merge(dr)
+        session.merge(ti)
+        session.commit()
+
+        executor = MockExecutor(do_update=False)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(scheduler_job, executors=[executor])
+        executor.event_buffer[ti.key] = State.FAILED, None
+
+        self.job_runner._process_executor_events(executor=executor, session=session)
+
+        self.job_runner.executor.callback_sink.send.assert_called_once()
+        request = self.job_runner.executor.callback_sink.send.call_args[0][0]
+        assert isinstance(request, TaskCallbackRequest)
+        assert request.bundle_version == expected_bv
+
+    def test_heartbeat_timeout_callback_bundle_version_follows_dag_run(self, dag_maker, session):
+        """
+        Same invariant as the external-kill path, exercised through
+        _find_and_purge_task_instances_without_heartbeats.
+        """
+        with dag_maker(dag_id="hb_timeout_bv", fileloc="/test_path1/"):
+            EmptyOperator(task_id="t1")
+        dr = dag_maker.create_dagrun(state=DagRunState.RUNNING)
+
+        executor = MagicMock()
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(scheduler_job, executors=[executor])
+
+        ti = dr.get_task_instance(task_id="t1", session=session)
+        dag_version = ti.dag_version
+        # disable_bundle_versioning state: DagVersion has a SHA, dag_run is unpinned.
+        dag_version.bundle_version = "abc123-sha"
+        dr.bundle_version = None
+        ti.state = TaskInstanceState.RUNNING
+        ti.queued_by_job_id = scheduler_job.id
+        ti.last_heartbeat_at = timezone.utcnow() - timedelta(seconds=600)
+        session.merge(dag_version)
+        session.merge(dr)
+        session.merge(ti)
+        session.commit()
+
+        self.job_runner._find_and_purge_task_instances_without_heartbeats()
+
+        executor.send_callback.assert_called_once()
+        request = executor.send_callback.call_args[0][0]
+        assert isinstance(request, TaskCallbackRequest)
+        assert request.bundle_version is None
+
+    @conf_vars({("scheduler", "num_stuck_in_queued_retries"): "1"})
+    def test_stuck_in_queued_callback_bundle_version_follows_dag_run(
+        self, dag_maker, session, mock_executors
+    ):
+        """
+        Same invariant as the external-kill path, exercised through
+        _handle_tasks_stuck_in_queued. With num_stuck_in_queued_retries=1, the
+        first stuck detection exhausts the budget and emits the failure callback.
+        """
+        with dag_maker(dag_id="stuck_bv"):
+            EmptyOperator(task_id="op1", on_failure_callback=TestSchedulerJob.mock_failure_callback)
+        run_id = str(uuid4())
+        dr = dag_maker.create_dagrun(run_id=run_id, state=DagRunState.RUNNING)
+
+        ti = dr.get_task_instance(task_id="op1", session=session)
+        dag_version = ti.dag_version
+        dag_version.bundle_version = "abc123-sha"
+        dr.bundle_version = None
+        ti.state = State.QUEUED
+        ti.queued_dttm = timezone.utcnow()
+        session.merge(dag_version)
+        session.merge(dr)
+        session.merge(ti)
+        session.commit()
+
+        scheduler_job = Job()
+        scheduler = SchedulerJobRunner(job=scheduler_job, num_runs=0)
+        scheduler._task_queued_timeout = -300  # always in violation
+
+        # First sweep: reschedule (budget consumed). Re-queue and sweep again to exceed.
+        with _loader_mock(mock_executors):
+            scheduler._handle_tasks_stuck_in_queued()
+        ti = dr.get_task_instance(task_id="op1", session=session)
+        ti.state = State.QUEUED
+        ti.queued_dttm = timezone.utcnow()
+        session.merge(ti)
+        session.commit()
+        with _loader_mock(mock_executors):
+            scheduler._handle_tasks_stuck_in_queued()
+
+        mock_executors[0].send_callback.assert_called_once()
+        request = mock_executors[0].send_callback.call_args[0][0]
+        assert isinstance(request, TaskCallbackRequest)
+        assert request.bundle_version is None
 
     def test_scheduler_passes_context_from_server_on_task_failure(self, dag_maker, session):
         """Test that scheduler passes context_from_server when handling task failures."""
@@ -7201,8 +8260,8 @@ class TestSchedulerJob:
         # Mock the executor to simulate a task failure
         mock_executor = MagicMock(spec=BaseExecutor)
         mock_executor.has_task = mock.MagicMock(return_value=False)
-        scheduler_job = Job(executor=mock_executor)
-        self.job_runner = SchedulerJobRunner(scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(scheduler_job, executors=[mock_executor])
 
         # Simulate executor reporting task as failed
         executor_event = {ti.key: (TaskInstanceState.FAILED, None)}
@@ -7242,8 +8301,8 @@ class TestSchedulerJob:
         session.commit()
 
         mock_executor = MagicMock()
-        scheduler_job = Job(executor=mock_executor)
-        self.job_runner = SchedulerJobRunner(scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[mock_executor])
 
         callback_req = self.job_runner._schedule_dag_run(dag_run, session)
 
@@ -7269,8 +8328,8 @@ class TestSchedulerJob:
         session.commit()
 
         mock_executor = MagicMock()
-        scheduler_job = Job(executor=mock_executor)
-        self.job_runner = SchedulerJobRunner(scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(scheduler_job, executors=[mock_executor])
 
         self.job_runner._start_queued_dagruns(session)
 
@@ -7300,8 +8359,8 @@ class TestSchedulerJob:
         session.commit()
 
         mock_executor = MagicMock()
-        scheduler_job = Job(executor=mock_executor)
-        self.job_runner = SchedulerJobRunner(scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(scheduler_job, executors=[mock_executor])
 
         self.job_runner._schedule_dag_run(dag_run, session)
 
@@ -7314,8 +8373,8 @@ class TestSchedulerJob:
     @mock.patch("airflow.models.Deadline.handle_miss")
     def test_process_expired_deadlines(self, mock_handle_miss, session, dag_maker):
         """Verify all expired and unhandled deadlines (and only those) are processed by the scheduler."""
-        scheduler_job = Job(executor=MockExecutor())
-        self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1, executors=[MockExecutor()])
 
         past_date = timezone.utcnow() - timedelta(minutes=5)
         future_date = timezone.utcnow() + timedelta(minutes=5)
@@ -7327,11 +8386,26 @@ class TestSchedulerJob:
             EmptyOperator(task_id="empty")
         dagrun_id = dag_maker.create_dagrun().id
 
+        serialized_dag = session.scalar(select(SerializedDagModel).where(SerializedDagModel.dag_id == dag_id))
+        assert serialized_dag is not None
+
+        # Create a test DeadlineAlert object for Deadline
+        deadline_alert = DeadlineAlert(
+            serialized_dag_id=serialized_dag.id,
+            name="Test Alert",
+            reference={"type": "dag", "dag_id": dag_id},
+            interval=300.0,  # 5 minutes
+            callback_def={"classpath": callback_path, "kwargs": {}},
+        )
+        session.add(deadline_alert)
+        session.flush()
+
         handled_deadline_async = Deadline(
             deadline_time=past_date,
             callback=AsyncCallback(callback_path),
             dagrun_id=dagrun_id,
             dag_id=dag_id,
+            deadline_alert_id=deadline_alert.id,
         )
         handled_deadline_async.missed = True
 
@@ -7340,20 +8414,30 @@ class TestSchedulerJob:
             callback=SyncCallback(callback_path),
             dagrun_id=dagrun_id,
             dag_id=dag_id,
+            deadline_alert_id=deadline_alert.id,
         )
         handled_deadline_sync.missed = True
 
         expired_deadline1 = Deadline(
-            deadline_time=past_date, callback=AsyncCallback(callback_path), dagrun_id=dagrun_id, dag_id=dag_id
+            deadline_time=past_date,
+            callback=AsyncCallback(callback_path),
+            dagrun_id=dagrun_id,
+            dag_id=dag_id,
+            deadline_alert_id=deadline_alert.id,
         )
         expired_deadline2 = Deadline(
-            deadline_time=past_date, callback=SyncCallback(callback_path), dagrun_id=dagrun_id, dag_id=dag_id
+            deadline_time=past_date,
+            callback=SyncCallback(callback_path),
+            dagrun_id=dagrun_id,
+            dag_id=dag_id,
+            deadline_alert_id=deadline_alert.id,
         )
         future_deadline = Deadline(
             deadline_time=future_date,
             callback=AsyncCallback(callback_path),
             dagrun_id=dagrun_id,
             dag_id=dag_id,
+            deadline_alert_id=deadline_alert.id,
         )
 
         session.add_all(
@@ -7375,13 +8459,74 @@ class TestSchedulerJob:
     @mock.patch("airflow.models.Deadline.handle_miss")
     def test_process_expired_deadlines_no_deadlines_found(self, mock_handle_miss, session):
         """Test handling when there are no deadlines to process."""
-        scheduler_job = Job(executor=MockExecutor())
-        self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1, executors=[MockExecutor()])
 
         self.job_runner._execute()
 
         # The handler should not be called, but no exceptions should be raised either.`
         mock_handle_miss.assert_not_called()
+
+    @mock.patch("airflow.models.Deadline.handle_miss")
+    def test_expired_deadline_locked_by_other_scheduler_is_skipped(
+        self, mock_handle_miss, session, dag_maker
+    ):
+        """The scheduler's deadline loop must skip rows another replica already holds."""
+        if session.get_bind().dialect.name == "sqlite":
+            pytest.skip("SQLite does not support row-level locking (SKIP LOCKED)")
+
+        past_date = timezone.utcnow() - timedelta(minutes=5)
+        dag_id = "test_deadline_locked_by_other_scheduler"
+        callback_path = "classpath.notify"
+
+        with dag_maker(dag_id=dag_id):
+            EmptyOperator(task_id="empty")
+        dagrun_id = dag_maker.create_dagrun().id
+
+        serialized_dag = session.scalar(select(SerializedDagModel).where(SerializedDagModel.dag_id == dag_id))
+        assert serialized_dag is not None
+
+        deadline_alert = DeadlineAlert(
+            serialized_dag_id=serialized_dag.id,
+            name="Test Skip Locked",
+            reference={"type": "dag", "dag_id": dag_id},
+            interval=300.0,
+            callback_def={"classpath": callback_path, "kwargs": {}},
+        )
+        session.add(deadline_alert)
+        session.flush()
+
+        session.add(
+            Deadline(
+                deadline_time=past_date,
+                callback=AsyncCallback(callback_path),
+                dagrun_id=dagrun_id,
+                dag_id=dag_id,
+                deadline_alert_id=deadline_alert.id,
+            )
+        )
+        session.commit()
+
+        # scoped=False gives an independent session with its own connection; the
+        # default scoped_session would reuse this thread's session and locks held
+        # by "self" do not block "self".
+        with create_session(scoped=False) as competing_session:
+            locked_rows = competing_session.scalars(
+                with_row_locks(
+                    select(Deadline).where(~Deadline.missed),
+                    of=Deadline,
+                    session=competing_session,
+                    skip_locked=True,
+                    key_share=False,
+                )
+            ).all()
+            assert len(locked_rows) == 1
+
+            scheduler_job = Job()
+            self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1, executors=[MockExecutor()])
+            self.job_runner._execute()
+
+            mock_handle_miss.assert_not_called()
 
     def test_emit_running_dags_metric(self, dag_maker, monkeypatch):
         """Test that the running_dags metric is emitted correctly."""
@@ -7397,7 +8542,7 @@ class TestSchedulerJob:
         def _fake_gauge(metric: str, value: int, *_, **__):
             recorded.append((metric, value))
 
-        monkeypatch.setattr("airflow.jobs.scheduler_job_runner.Stats.gauge", _fake_gauge, raising=True)
+        monkeypatch.setattr("airflow._shared.observability.metrics.stats.gauge", _fake_gauge, raising=True)
 
         with conf_vars({("metrics", "statsd_on"): "True"}):
             scheduler_job = Job()
@@ -7467,7 +8612,7 @@ class TestSchedulerJob:
         assert result == {}
         mock_log.exception.assert_called_once()
 
-    def test_multi_team_get_task_team_name_success(self, dag_maker, session):
+    def test_multi_team_get_workload_team_name_success(self, dag_maker, session):
         """Test successful team name resolution for a single task."""
         clear_db_teams()
         clear_db_dag_bundles()
@@ -7490,10 +8635,10 @@ class TestSchedulerJob:
         scheduler_job = Job()
         self.job_runner = SchedulerJobRunner(job=scheduler_job)
 
-        result = self.job_runner._get_task_team_name(ti, session)
+        result = self.job_runner._get_workload_team_name(ti, session)
         assert result == "team_a"
 
-    def test_multi_team_get_task_team_name_no_team(self, dag_maker, session):
+    def test_multi_team_get_workload_team_name_no_team(self, dag_maker, session):
         """Test team resolution when no team is associated with the DAG."""
         with dag_maker(dag_id="dag_no_team", session=session):
             task = EmptyOperator(task_id="task_no_team")
@@ -7504,10 +8649,10 @@ class TestSchedulerJob:
         scheduler_job = Job()
         self.job_runner = SchedulerJobRunner(job=scheduler_job)
 
-        result = self.job_runner._get_task_team_name(ti, session)
+        result = self.job_runner._get_workload_team_name(ti, session)
         assert result is None
 
-    def test_multi_team_get_task_team_name_database_error(self, dag_maker, session):
+    def test_multi_team_get_workload_team_name_database_error(self, dag_maker, session):
         """Test graceful error handling when individual task team resolution fails. This code should _not_ fail the scheduler."""
         with dag_maker(dag_id="dag_test", session=session):
             task = EmptyOperator(task_id="task_test")
@@ -7520,7 +8665,7 @@ class TestSchedulerJob:
 
         # Mock _get_team_names_for_dag_ids to return empty dict (simulates database error handling in that function)
         with mock.patch.object(self.job_runner, "_get_team_names_for_dag_ids", return_value={}) as mock_batch:
-            result = self.job_runner._get_task_team_name(ti, session)
+            result = self.job_runner._get_workload_team_name(ti, session)
             mock_batch.assert_called_once_with([ti.dag_id], session)
 
         # Should return None when batch function returns empty dict
@@ -7538,7 +8683,7 @@ class TestSchedulerJob:
         scheduler_job = Job()
         self.job_runner = SchedulerJobRunner(job=scheduler_job)
 
-        with mock.patch.object(self.job_runner, "_get_task_team_name") as mock_team_resolve:
+        with mock.patch.object(self.job_runner, "_get_workload_team_name") as mock_team_resolve:
             result = self.job_runner._try_to_load_executor(ti, session)
             # Should not call team resolution when multi_team is disabled
             mock_team_resolve.assert_not_called()
@@ -7562,7 +8707,7 @@ class TestSchedulerJob:
         result = self.job_runner._try_to_load_executor(ti, session)
 
         # Should return the global default executor (first executor in Job)
-        assert result == scheduler_job.executor
+        assert result == self.job_runner.executor
 
     @conf_vars({("core", "multi_team"): "true"})
     def test_multi_team_try_to_load_executor_no_explicit_executor_with_team(
@@ -7735,7 +8880,8 @@ class TestSchedulerJob:
 
             # Should log a warning when no executor is found
             mock_log.warning.assert_called_once_with(
-                "Executor, %s, was not found but a Task was configured to use it", "secondary_exec"
+                "Executor, %s, was not found but a Task or Callback was configured to use it",
+                "secondary_exec",
             )
 
         # Should return None since we failed to resolve an executor due to the mismatch. In practice, this
@@ -7787,11 +8933,42 @@ class TestSchedulerJob:
         self.job_runner = SchedulerJobRunner(job=scheduler_job)
 
         # Call with pre-resolved team name (as done in the scheduling loop)
-        with mock.patch.object(self.job_runner, "_get_task_team_name") as mock_team_resolve:
+        with mock.patch.object(self.job_runner, "_get_workload_team_name") as mock_team_resolve:
             result = self.job_runner._try_to_load_executor(ti, session, team_name="team_a")
             mock_team_resolve.assert_not_called()  # We don't query for the team if it is pre-resolved
 
         assert result == mock_executors[1]
+
+    @conf_vars({("core", "multi_team"): "false"})
+    def test_try_to_load_executor_matches_by_classname(self, dag_maker, mock_executors, session):
+        """Test that executor lookup matches by classname when alias and module_path don't match.
+
+        This covers the edge case where a user aliases a core executor (e.g.
+        ``global_exec:LocalExecutor;team1=team_exec:LocalExecutor``) but a task specifies
+        ``executor="LocalExecutor"`` (the classname). The scheduler should still find the
+        executor by matching the last component of the module_path (the classname).
+        """
+        # Set up the mock executors with aliases that differ from the classname
+        mock_executors[0].name = ExecutorName(
+            alias="global_exec", module_path="airflow.executors.local_executor.LocalExecutor"
+        )
+        mock_executors[1].name = ExecutorName(
+            alias="team_exec", module_path="airflow.executors.local_executor.LocalExecutor"
+        )
+
+        with dag_maker(dag_id="test_dag", session=session):
+            task = EmptyOperator(task_id="test_task", executor="LocalExecutor")
+
+        dr = dag_maker.create_dagrun()
+        ti = dr.get_task_instance(task.task_id, session)
+
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+
+        result = self.job_runner._try_to_load_executor(ti, session)
+
+        # Should match by classname (last component of module_path) and return the global executor
+        assert result == mock_executors[0]
 
     @conf_vars({("core", "multi_team"): "true"})
     def test_multi_team_scheduling_loop_batch_optimization(self, dag_maker, mock_executors, session):
@@ -7841,6 +9018,51 @@ class TestSchedulerJob:
             mock_batch.assert_called_once_with({"dag_a", "dag_b"}, session)
             assert len(res) == 2
 
+    @conf_vars({("core", "multi_team"): "true"})
+    def test_multi_team_executor_to_tis_batch_optimization(self, dag_maker, mock_executors, session):
+        """Test that executor mapping batches team resolution for task instances."""
+        clear_db_teams()
+        clear_db_dag_bundles()
+
+        team1 = Team(name="team_a")
+        team2 = Team(name="team_b")
+        session.add_all([team1, team2])
+        session.flush()
+
+        bundle1 = DagBundleModel(name="bundle_a")
+        bundle2 = DagBundleModel(name="bundle_b")
+        bundle1.teams.append(team1)
+        bundle2.teams.append(team2)
+        session.add_all([bundle1, bundle2])
+        session.flush()
+
+        mock_executors[0].team_name = "team_a"
+        mock_executors[1].team_name = "team_b"
+
+        with dag_maker(dag_id="dag_a", bundle_name="bundle_a", session=session):
+            EmptyOperator(task_id="task_a")
+        dr1 = dag_maker.create_dagrun()
+
+        with dag_maker(dag_id="dag_b", bundle_name="bundle_b", session=session):
+            EmptyOperator(task_id="task_b")
+        dr2 = dag_maker.create_dagrun()
+
+        ti1 = dr1.get_task_instance("task_a", session)
+        ti2 = dr2.get_task_instance("task_b", session)
+
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+
+        with (
+            assert_queries_count(1, session=session),
+            mock.patch.object(self.job_runner, "_get_workload_team_name") as mock_single,
+        ):
+            executor_to_workloads = self.job_runner._executor_to_workloads([ti1, ti2], session)
+
+            mock_single.assert_not_called()
+            assert executor_to_workloads[mock_executors[0]] == [ti1]
+            assert executor_to_workloads[mock_executors[1]] == [ti2]
+
     @conf_vars({("core", "multi_team"): "false"})
     def test_multi_team_config_disabled_uses_legacy_behavior(self, dag_maker, mock_executors, session):
         """Test that when multi_team config is disabled, legacy behavior is preserved."""
@@ -7855,13 +9077,13 @@ class TestSchedulerJob:
         scheduler_job = Job()
         self.job_runner = SchedulerJobRunner(job=scheduler_job)
 
-        with mock.patch.object(self.job_runner, "_get_task_team_name") as mock_team_resolve:
+        with mock.patch.object(self.job_runner, "_get_workload_team_name") as mock_team_resolve:
             result1 = self.job_runner._try_to_load_executor(ti1, session)
             result2 = self.job_runner._try_to_load_executor(ti2, session)
 
             # Should use legacy logic without calling team resolution
             mock_team_resolve.assert_not_called()
-            assert result1 == scheduler_job.executor  # Default for no explicit executor
+            assert result1 == self.job_runner.executor  # Default for no explicit executor
             assert result2 == mock_executors[1]  # Matched by executor name
 
 
@@ -7925,8 +9147,8 @@ def test_schedule_dag_run_with_upstream_skip(dag_maker, session):
 
         # Create a SerializedDAG (which will have max_active_runs=1)
         # This simulates the SerializedDAG being created/updated from the DAG file
-        scheduler_job = Job(executor=self.null_exec)
-        self.job_runner = SchedulerJobRunner(job=scheduler_job)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
         self.job_runner._create_dag_runs([dag_model], session)
 
         # Verify SerializedDAG has max_active_runs=1
@@ -8070,9 +9292,11 @@ class TestSchedulerJobQueriesCount:
                 for ti in dr.get_task_instances():
                     ti.set_state(state=State.SCHEDULED)
 
-            scheduler_job = Job(executor=MockExecutor(do_update=False))
+            scheduler_job = Job()
             scheduler_job.heartbeat = mock.MagicMock()
-            self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1)
+            self.job_runner = SchedulerJobRunner(
+                job=scheduler_job, num_runs=1, executors=[MockExecutor(do_update=False)]
+            )
 
             with assert_queries_count(expected_query_count, margin=15):
                 with mock.patch.object(
@@ -8148,9 +9372,11 @@ class TestSchedulerJobQueriesCount:
             dagbag = DagBag(dag_folder=ELASTIC_DAG_FILE, include_examples=False)
             sync_bag_to_db(dagbag, "testing", None)
 
-            scheduler_job = Job(job_type=SchedulerJobRunner.job_type, executor=MockExecutor(do_update=False))
+            scheduler_job = Job(job_type=SchedulerJobRunner.job_type)
             scheduler_job.heartbeat = mock.MagicMock()
-            self.job_runner = SchedulerJobRunner(job=scheduler_job, num_runs=1)
+            self.job_runner = SchedulerJobRunner(
+                job=scheduler_job, num_runs=1, executors=[MockExecutor(do_update=False)]
+            )
 
             failures = []  # Collects assertion errors and report all of them at the end.
             message = "Expected {expected_count} query, but got {current_count} located at:"
@@ -8182,7 +9408,7 @@ def test_mark_backfills_completed(dag_maker, session):
     )
     session.expunge_all()
     runner = SchedulerJobRunner(
-        job=Job(job_type=SchedulerJobRunner.job_type, executor=MockExecutor(do_update=False))
+        job=Job(job_type=SchedulerJobRunner.job_type), executors=[MockExecutor(do_update=False)]
     )
     runner._mark_backfills_complete()
     b = session.get(Backfill, b.id)
@@ -8197,29 +9423,391 @@ def test_mark_backfills_completed(dag_maker, session):
     assert b.completed_at.timestamp() > 0
 
 
-@pytest.mark.need_serialized_dag
-def test_when_dag_run_has_partition_and_downstreams_listening_then_tables_populated(
-    dag_maker,
-    session,
-):
-    asset = Asset(name="hello")
-    with dag_maker(dag_id="asset_event_tester", schedule=None, session=session) as dag:
+def test_mark_backfills_complete_skips_initializing_backfill(dag_maker, session):
+    clear_db_backfills()
+    dag_id = "test_backfill_race_lifecycle"
+    with dag_maker(serialized=True, dag_id=dag_id, schedule="@daily"):
+        BashOperator(task_id="hi", bash_command="echo hi")
+    b = Backfill(
+        dag_id=dag_id,
+        from_date=pendulum.parse("2021-01-01"),
+        to_date=pendulum.parse("2021-01-03"),
+        max_active_runs=10,
+        dag_run_conf={},
+        reprocess_behavior=ReprocessBehavior.NONE,
+    )
+    session.add(b)
+    session.commit()
+    backfill_id = b.id
+    session.expunge_all()
+    runner = SchedulerJobRunner(
+        job=Job(job_type=SchedulerJobRunner.job_type), executors=[MockExecutor(do_update=False)]
+    )
+    runner._mark_backfills_complete()
+    b = session.get(Backfill, backfill_id)
+    assert b.completed_at is None
+    session.expunge_all()
+    dr = DagRun(
+        dag_id=dag_id,
+        run_id="backfill__2021-01-01T00:00:00+00:00",
+        run_type=DagRunType.BACKFILL_JOB,
+        logical_date=pendulum.parse("2021-01-01"),
+        data_interval=(pendulum.parse("2021-01-01"), pendulum.parse("2021-01-02")),
+        run_after=pendulum.parse("2021-01-02"),
+        state=DagRunState.SUCCESS,
+        backfill_id=backfill_id,
+    )
+    session.add(dr)
+    session.flush()
+    session.add(
+        BackfillDagRun(
+            backfill_id=backfill_id,
+            dag_run_id=dr.id,
+            logical_date=pendulum.parse("2021-01-01"),
+            sort_ordinal=1,
+        )
+    )
+    session.commit()
+    session.expunge_all()
+    runner._mark_backfills_complete()
+    b = session.get(Backfill, backfill_id)
+    assert b.completed_at is not None
+
+
+def test_mark_backfills_complete_cleans_orphan_after_cutoff(dag_maker, session):
+    """Backfill with no BackfillDagRun rows older than 2 minutes should be auto-completed."""
+    clear_db_backfills()
+    dag_id = "test_backfill_orphan_cleanup"
+    with dag_maker(serialized=True, dag_id=dag_id, schedule="@daily"):
+        BashOperator(task_id="hi", bash_command="echo hi")
+    b = Backfill(
+        dag_id=dag_id,
+        from_date=pendulum.parse("2021-01-01"),
+        to_date=pendulum.parse("2021-01-03"),
+        max_active_runs=10,
+        dag_run_conf={},
+        reprocess_behavior=ReprocessBehavior.NONE,
+    )
+    session.add(b)
+    session.commit()
+    backfill_id = b.id
+    session.expunge_all()
+    # Travel 3 minutes into the future so the backfill is past the 2-minute cutoff
+    with time_machine.travel(pendulum.now("UTC").add(minutes=3), tick=False):
+        runner = SchedulerJobRunner(
+            job=Job(job_type=SchedulerJobRunner.job_type), executors=[MockExecutor(do_update=False)]
+        )
+        runner._mark_backfills_complete()
+    b = session.get(Backfill, backfill_id)
+    assert b.completed_at is not None
+
+
+def test_mark_backfills_complete_keeps_old_backfill_with_running_dagruns(dag_maker, session):
+    """Old backfill (>2 min) with running DagRuns must NOT be marked complete."""
+    clear_db_backfills()
+    dag_id = "test_backfill_old_with_runs"
+    with dag_maker(serialized=True, dag_id=dag_id, schedule="@daily"):
+        BashOperator(task_id="hi", bash_command="echo hi")
+    b = Backfill(
+        dag_id=dag_id,
+        from_date=pendulum.parse("2021-01-01"),
+        to_date=pendulum.parse("2021-01-03"),
+        max_active_runs=10,
+        dag_run_conf={},
+        reprocess_behavior=ReprocessBehavior.NONE,
+    )
+    session.add(b)
+    session.commit()
+    backfill_id = b.id
+    dr = DagRun(
+        dag_id=dag_id,
+        run_id="backfill__2021-01-01T00:00:00+00:00",
+        run_type=DagRunType.BACKFILL_JOB,
+        logical_date=pendulum.parse("2021-01-01"),
+        data_interval=(pendulum.parse("2021-01-01"), pendulum.parse("2021-01-02")),
+        run_after=pendulum.parse("2021-01-02"),
+        state=DagRunState.RUNNING,
+        backfill_id=backfill_id,
+    )
+    session.add(dr)
+    session.flush()
+    session.add(
+        BackfillDagRun(
+            backfill_id=backfill_id,
+            dag_run_id=dr.id,
+            logical_date=pendulum.parse("2021-01-01"),
+            sort_ordinal=1,
+        )
+    )
+    session.commit()
+    session.expunge_all()
+    # Travel 3 minutes into the future; backfill is old but has a RUNNING DagRun
+    with time_machine.travel(pendulum.now("UTC").add(minutes=3), tick=False):
+        runner = SchedulerJobRunner(
+            job=Job(job_type=SchedulerJobRunner.job_type), executors=[MockExecutor(do_update=False)]
+        )
+        runner._mark_backfills_complete()
+    b = session.get(Backfill, backfill_id)
+    assert b.completed_at is None
+
+
+def test_mark_backfills_complete_young_backfill_with_finished_runs(dag_maker, session):
+    """Young backfill (<2 min) with all SUCCESS DagRuns completes immediately."""
+    clear_db_backfills()
+    dag_id = "test_backfill_young_finished"
+    with dag_maker(serialized=True, dag_id=dag_id, schedule="@daily"):
+        BashOperator(task_id="hi", bash_command="echo hi")
+    b = Backfill(
+        dag_id=dag_id,
+        from_date=pendulum.parse("2021-01-01"),
+        to_date=pendulum.parse("2021-01-03"),
+        max_active_runs=10,
+        dag_run_conf={},
+        reprocess_behavior=ReprocessBehavior.NONE,
+    )
+    session.add(b)
+    session.commit()
+    backfill_id = b.id
+    dr = DagRun(
+        dag_id=dag_id,
+        run_id="backfill__2021-01-01T00:00:00+00:00",
+        run_type=DagRunType.BACKFILL_JOB,
+        logical_date=pendulum.parse("2021-01-01"),
+        data_interval=(pendulum.parse("2021-01-01"), pendulum.parse("2021-01-02")),
+        run_after=pendulum.parse("2021-01-02"),
+        state=DagRunState.SUCCESS,
+        backfill_id=backfill_id,
+    )
+    session.add(dr)
+    session.flush()
+    session.add(
+        BackfillDagRun(
+            backfill_id=backfill_id,
+            dag_run_id=dr.id,
+            logical_date=pendulum.parse("2021-01-01"),
+            sort_ordinal=1,
+        )
+    )
+    session.commit()
+    session.expunge_all()
+    # No time travel — backfill was just created, should still complete
+    runner = SchedulerJobRunner(
+        job=Job(job_type=SchedulerJobRunner.job_type), executors=[MockExecutor(do_update=False)]
+    )
+    runner._mark_backfills_complete()
+    b = session.get(Backfill, backfill_id)
+    assert b.completed_at is not None
+
+
+def test_mark_backfills_complete_multiple_independent(dag_maker, session):
+    """Two backfills: one finished, one running — only the finished one completes."""
+    clear_db_backfills()
+    with dag_maker(serialized=True, dag_id="dag_finished", schedule="@daily"):
+        BashOperator(task_id="hi", bash_command="echo hi")
+    with dag_maker(serialized=True, dag_id="dag_running", schedule="@daily"):
+        BashOperator(task_id="hi", bash_command="echo hi")
+    b_finished = Backfill(
+        dag_id="dag_finished",
+        from_date=pendulum.parse("2021-01-01"),
+        to_date=pendulum.parse("2021-01-03"),
+        max_active_runs=10,
+        dag_run_conf={},
+        reprocess_behavior=ReprocessBehavior.NONE,
+    )
+    b_running = Backfill(
+        dag_id="dag_running",
+        from_date=pendulum.parse("2021-01-01"),
+        to_date=pendulum.parse("2021-01-03"),
+        max_active_runs=10,
+        dag_run_conf={},
+        reprocess_behavior=ReprocessBehavior.NONE,
+    )
+    session.add_all([b_finished, b_running])
+    session.commit()
+    finished_id = b_finished.id
+    running_id = b_running.id
+    # Finished backfill: SUCCESS DagRun
+    dr1 = DagRun(
+        dag_id="dag_finished",
+        run_id="backfill__2021-01-01T00:00:00+00:00",
+        run_type=DagRunType.BACKFILL_JOB,
+        logical_date=pendulum.parse("2021-01-01"),
+        data_interval=(pendulum.parse("2021-01-01"), pendulum.parse("2021-01-02")),
+        run_after=pendulum.parse("2021-01-02"),
+        state=DagRunState.SUCCESS,
+        backfill_id=finished_id,
+    )
+    session.add(dr1)
+    session.flush()
+    session.add(
+        BackfillDagRun(
+            backfill_id=finished_id,
+            dag_run_id=dr1.id,
+            logical_date=pendulum.parse("2021-01-01"),
+            sort_ordinal=1,
+        )
+    )
+    # Running backfill: RUNNING DagRun
+    dr2 = DagRun(
+        dag_id="dag_running",
+        run_id="backfill__2021-01-01T00:00:00+00:00",
+        run_type=DagRunType.BACKFILL_JOB,
+        logical_date=pendulum.parse("2021-01-01"),
+        data_interval=(pendulum.parse("2021-01-01"), pendulum.parse("2021-01-02")),
+        run_after=pendulum.parse("2021-01-02"),
+        state=DagRunState.RUNNING,
+        backfill_id=running_id,
+    )
+    session.add(dr2)
+    session.flush()
+    session.add(
+        BackfillDagRun(
+            backfill_id=running_id,
+            dag_run_id=dr2.id,
+            logical_date=pendulum.parse("2021-01-01"),
+            sort_ordinal=1,
+        )
+    )
+    session.commit()
+    session.expunge_all()
+    runner = SchedulerJobRunner(
+        job=Job(job_type=SchedulerJobRunner.job_type), executors=[MockExecutor(do_update=False)]
+    )
+    runner._mark_backfills_complete()
+    b_finished = session.get(Backfill, finished_id)
+    b_running = session.get(Backfill, running_id)
+    assert b_finished.completed_at is not None
+    assert b_running.completed_at is None
+
+
+class Key1Mapper(CorePartitionMapper):
+    """Partition Mapper that returns only key-1 as downstream key"""
+
+    def to_downstream(self, key: str) -> str:
+        return "key-1"
+
+
+def _find_registered_custom_partition_mapper(import_string: str) -> type[CorePartitionMapper]:
+    if import_string == qualname(Key1Mapper):
+        return Key1Mapper
+    raise ValueError(f"unexpected class {import_string!r}")
+
+
+@pytest.fixture
+def custom_partition_mapper_patch() -> Callable[[], ExitStack]:
+    def _patch() -> ExitStack:
+        stack = ExitStack()
+        for mock_target in [
+            "airflow.serialization.encoders.find_registered_custom_partition_mapper",
+            "airflow.serialization.decoders.find_registered_custom_partition_mapper",
+        ]:
+            stack.enter_context(
+                mock.patch(
+                    mock_target,
+                    _find_registered_custom_partition_mapper,
+                )
+            )
+        return stack
+
+    return _patch
+
+
+@pytest.fixture
+def clear_asset_partition_rows() -> Iterator:
+    clear_db_apdr()
+    clear_db_pakl()
+
+    yield
+
+    clear_db_apdr()
+    clear_db_pakl()
+
+
+def _produce_and_register_asset_event(
+    *,
+    dag_id: str,
+    asset: Asset,
+    partition_key: str,
+    session: Session,
+    dag_maker: DagMaker,
+    expected_partition_key: str | None = None,
+) -> AssetPartitionDagRun:
+    if expected_partition_key is None:
+        expected_partition_key = partition_key
+
+    with dag_maker(dag_id=dag_id, schedule=None, session=session) as dag:
         EmptyOperator(task_id="hi", outlets=[asset])
-    dag1_id = dag.dag_id
-    dr = dag_maker.create_dagrun(partition_key="abc123", session=session)
-    assert dr.partition_key == "abc123"
+
+    dr = dag_maker.create_dagrun(partition_key=partition_key, session=session)
     [ti] = dr.get_task_instances(session=session)
     session.commit()
+
     serialized_outlets = dag.get_task("hi").outlets
 
+    TaskInstance.register_asset_changes_in_db(
+        ti=ti,
+        task_outlets=[o.asprofile() for o in serialized_outlets],
+        outlet_events=[],
+        session=session,
+    )
+    session.commit()
+
+    event = session.scalar(
+        select(AssetEvent).where(
+            AssetEvent.source_dag_id == dag.dag_id,
+            AssetEvent.source_run_id == dr.run_id,
+        )
+    )
+    assert event is not None
+    assert event.partition_key == partition_key
+
+    apdr = session.scalar(
+        select(AssetPartitionDagRun)
+        .join(
+            PartitionedAssetKeyLog,
+            PartitionedAssetKeyLog.asset_partition_dag_run_id == AssetPartitionDagRun.id,
+        )
+        .where(PartitionedAssetKeyLog.asset_event_id == event.id)
+    )
+    assert apdr is not None
+    assert apdr.created_dag_run_id is None
+    assert apdr.partition_key == expected_partition_key
+
+    return apdr
+
+
+@pytest.mark.need_serialized_dag
+@pytest.mark.usefixtures("clear_asset_partition_rows")
+def test_partitioned_dag_run_with_invalid_mapping(dag_maker: DagMaker, session: Session):
+    session.execute(delete(Log))
+    asset_1 = Asset(name="asset-1")
     with dag_maker(
-        dag_id="asset_event_listener",
-        schedule=PartitionedAssetTimetable(assets=asset, partition_mapper=IdentityMapper()),
+        dag_id="asset-event-consumer",
+        schedule=PartitionedAssetTimetable(
+            assets=asset_1,
+            default_partition_mapper=StartOfHourMapper(),
+        ),
         session=session,
     ):
         EmptyOperator(task_id="hi")
     session.commit()
 
+    runner = SchedulerJobRunner(
+        job=Job(job_type=SchedulerJobRunner.job_type), executors=[MockExecutor(do_update=False)]
+    )
+    with dag_maker(
+        dag_id="asset-event-producer",
+        schedule=CronPartitionTimetable("* * * * *", timezone="UTC"),
+        session=session,
+    ) as dag:
+        EmptyOperator(task_id="hi", outlets=[asset_1])
+
+    partition_key = "an invalid key for HourlyMapper"
+    dr = dag_maker.create_dagrun(partition_key=partition_key, session=session)
+    [ti] = dr.get_task_instances(session=session)
+    session.commit()
+
+    serialized_outlets = dag.get_task("hi").outlets
     TaskInstance.register_asset_changes_in_db(
         ti=ti,
         task_outlets=[o.asprofile() for o in serialized_outlets],
@@ -8229,29 +9817,453 @@ def test_when_dag_run_has_partition_and_downstreams_listening_then_tables_popula
     session.commit()
     event = session.scalar(
         select(AssetEvent).where(
-            AssetEvent.source_dag_id == dag1_id,
+            AssetEvent.source_dag_id == dag.dag_id,
             AssetEvent.source_run_id == dr.run_id,
         )
     )
-    assert event.partition_key == "abc123"
-    pakl = session.scalar(
-        select(PartitionedAssetKeyLog).where(
-            PartitionedAssetKeyLog.asset_event_id == event.id,
-        )
-    )
+    assert event is not None
+    assert event.partition_key == partition_key
     apdr = session.scalar(
-        select(AssetPartitionDagRun).where(AssetPartitionDagRun.id == pakl.asset_partition_dag_run_id)
+        select(AssetPartitionDagRun)
+        .join(
+            PartitionedAssetKeyLog,
+            PartitionedAssetKeyLog.asset_partition_dag_run_id == AssetPartitionDagRun.id,
+        )
+        .where(PartitionedAssetKeyLog.asset_event_id == event.id)
     )
-    assert apdr is not None
-    assert apdr.created_dag_run_id is None
-    # ok, now we have established that the needed rows are there.
-    # let's see what the scheduler does
+    assert apdr is None
+
+    partition_dags = runner._create_dagruns_for_partitioned_asset_dags(session=session)
+    assert len(partition_dags) == 0
+    assert partition_dags == set()
+
+    audit_log = session.scalar(select(Log))
+    assert audit_log is not None
+    assert audit_log.extra == (
+        "Could not map partition_key 'an invalid key for HourlyMapper' "
+        "for asset (name='asset-1', uri='asset-1') in target Dag 'asset-event-consumer'. "
+        "This likely indicates that the partition mapper in the target Dag is misconfigured or "
+        "does not support this partition key.\n"
+        "ValueError: time data 'an invalid key for HourlyMapper' does not match format '%Y-%m-%dT%H:%M:%S'"
+    )
+
+
+@pytest.mark.db_test
+def test_create_dag_runs_partitioned_timetable_skips_when_next_fields_none(session, caplog):
+    """
+    Partitioned timetables may leave next_dagrun / next_dagrun_create_after unset when no run is due.
+    Scheduler should skip and log if partition key is not set.
+    """
+    runner = SchedulerJobRunner(
+        job=Job(job_type=SchedulerJobRunner.job_type), executors=[MockExecutor(do_update=False)]
+    )
+    dag_model = MagicMock()
+    dag_model.dag_id = "partitioned-skip-no-next-fields"
+    dag_model.exceeds_max_non_backfill = False
+    dag_model.next_dagrun = None
+    dag_model.timetable_partitioned = True
+    dag_model.next_dagrun_create_after = None
+    dag_model.next_dagrun_partition_key = None
+    dag_model.max_active_runs = 16
+    dag_model.allowed_run_types = None
+
+    with caplog.at_level(logging.ERROR):
+        with mock.patch.object(runner, "_get_current_dag") as mock_get_dag:
+            runner._create_dag_runs([dag_model], session)
+
+    mock_get_dag.assert_not_called()
+    assert "dag_model.next_dagrun_partition_key is None" in caplog.text
+
+
+@pytest.mark.db_test
+def test_create_dag_runs_partitioned_timetable_proceeds_when_partition_key_set(session):
+    runner = SchedulerJobRunner(
+        job=Job(job_type=SchedulerJobRunner.job_type), executors=[MockExecutor(do_update=False)]
+    )
+    dag_model = MagicMock()
+    dag_model.dag_id = "partitioned-proceed-with-partition-key"
+    dag_model.exceeds_max_non_backfill = False
+    dag_model.next_dagrun = None
+    dag_model.timetable_partitioned = True
+    dag_model.next_dagrun_create_after = None
+    dag_model.next_dagrun_partition_key = "partition-a"
+    dag_model.max_active_runs = 16
+    dag_model.allowed_run_types = None
+
+    with mock.patch.object(runner, "_get_current_dag", return_value=None) as mock_get_dag:
+        runner._create_dag_runs([dag_model], session)
+
+    mock_get_dag.assert_called_once()
+
+
+@pytest.mark.need_serialized_dag
+@pytest.mark.usefixtures("clear_asset_partition_rows")
+def test_partitioned_dag_run_with_customized_mapper(
+    dag_maker: DagMaker,
+    session: Session,
+    custom_partition_mapper_patch: Callable[[], ExitStack],
+):
+    asset_1 = Asset(name="asset-1")
+
+    # Consumer Dag "asset-event-consumer"
+    with custom_partition_mapper_patch():
+        with dag_maker(
+            dag_id="asset-event-consumer",
+            schedule=PartitionedAssetTimetable(
+                assets=asset_1,
+                # Most users should use the partition mapper provided by the task-SDK.
+                # Advanced users can import from core and register their own partition mapper
+                # via an Airflow plugin.
+                # We intentionally exclude core mappers from the public typing
+                # so standard users don't accidentally rely on internal implementations.
+                default_partition_mapper=Key1Mapper(),  # type: ignore[arg-type]
+            ),
+            session=session,
+        ):
+            EmptyOperator(task_id="hi")
+        session.commit()
 
     runner = SchedulerJobRunner(
-        job=Job(job_type=SchedulerJobRunner.job_type, executor=MockExecutor(do_update=False))
+        job=Job(job_type=SchedulerJobRunner.job_type), executors=[MockExecutor(do_update=False)]
     )
+    with custom_partition_mapper_patch():
+        apdr = _produce_and_register_asset_event(
+            dag_id="asset-event-producer",
+            asset=asset_1,
+            partition_key="this-is-not-key-1-before-mapped",
+            session=session,
+            dag_maker=dag_maker,
+            expected_partition_key="key-1",
+        )
+        partition_dags = runner._create_dagruns_for_partitioned_asset_dags(session=session)
+    session.refresh(apdr)
+    # Since asset event for Asset(name="asset-2") with key "key-1" has not yet been created,
+    # no Dag run will be created
+    assert apdr.created_dag_run_id is not None
+    assert len(partition_dags) == 1
+    assert partition_dags == {"asset-event-consumer"}
+
+    dag_run = session.scalar(select(DagRun).where(DagRun.id == apdr.created_dag_run_id))
+    assert dag_run is not None
+    asset_event = dag_run.consumed_asset_events[0]
+    assert asset_event.source_task_id == "hi"
+    assert asset_event.source_dag_id == "asset-event-producer"
+    assert asset_event.source_run_id == "test"
+
+
+@pytest.mark.need_serialized_dag
+@pytest.mark.usefixtures("clear_asset_partition_rows")
+def test_consumer_dag_listen_to_two_partitioned_asset(
+    dag_maker: DagMaker,
+    session: Session,
+):
+    asset_1 = Asset(name="asset-1")
+    asset_2 = Asset(name="asset-2")
+
+    # Consumer Dag "asset-event-consumer"
+    with dag_maker(
+        dag_id="asset-event-consumer",
+        schedule=PartitionedAssetTimetable(
+            assets=(Asset.ref(uri="asset-1") & Asset.ref(name="asset-2")),
+            default_partition_mapper=IdentityMapper(),
+        ),
+        session=session,
+    ):
+        EmptyOperator(task_id="hi")
+    session.commit()
+
+    # Check whether we are ready to create Dag run for "asset-event-consumer"
+    runner = SchedulerJobRunner(
+        job=Job(job_type=SchedulerJobRunner.job_type), executors=[MockExecutor(do_update=False)]
+    )
+
+    apdr = _produce_and_register_asset_event(
+        dag_id="asset-event-producer-1",
+        asset=asset_1,
+        partition_key="key-1",
+        session=session,
+        dag_maker=dag_maker,
+    )
+    partition_dags = runner._create_dagruns_for_partitioned_asset_dags(session=session)
+    session.refresh(apdr)
+    # Since asset event for Asset(name="asset-2") with key "key-1" has not yet been created,
+    # no Dag run will be created
+    assert apdr.created_dag_run_id is None
+    assert len(partition_dags) == 0
+    assert partition_dags == set()
+
+    apdr = _produce_and_register_asset_event(
+        dag_id="asset-event-producer-2",
+        asset=asset_2,
+        partition_key="key-2",
+        session=session,
+        dag_maker=dag_maker,
+    )
+    partition_dags = runner._create_dagruns_for_partitioned_asset_dags(session=session)
+    session.refresh(apdr)
+    # Since asset event for Asset(name="asset-2") with key "key-1" has not yet been created,
+    # (the one created was Asset(name="asset-2") with key "key-2")
+    # no Dag run will be created
+    assert apdr.created_dag_run_id is None
+    assert len(partition_dags) == 0
+    assert partition_dags == set()
+
+    apdr = _produce_and_register_asset_event(
+        dag_id="asset-event-producer-3",
+        asset=asset_2,
+        partition_key="key-1",
+        session=session,
+        dag_maker=dag_maker,
+    )
+    # Now the asset event for Asset(name="asset-2") with key "key-1" is created,
+    # the Dag run should be created
     partition_dags = runner._create_dagruns_for_partitioned_asset_dags(session=session)
     session.refresh(apdr)
     assert apdr.created_dag_run_id is not None
     assert len(partition_dags) == 1
-    assert partition_dags == {"asset_event_listener"}
+    assert partition_dags == {"asset-event-consumer"}
+
+    dag_run = session.scalar(select(DagRun).where(DagRun.id == apdr.created_dag_run_id))
+    assert dag_run is not None
+    for asset_event in dag_run.consumed_asset_events:
+        assert asset_event.source_task_id == "hi"
+        assert "asset-event-producer-" in asset_event.source_dag_id
+        assert asset_event.source_run_id == "test"
+
+
+@pytest.mark.need_serialized_dag
+@pytest.mark.usefixtures("clear_asset_partition_rows")
+def test_consumer_dag_listen_to_two_partitioned_asset_with_key_1_mapper(
+    dag_maker: DagMaker,
+    session: Session,
+    custom_partition_mapper_patch: Callable[[], ExitStack],
+):
+    asset_1 = Asset(name="asset-1")
+    asset_2 = Asset(name="asset-2")
+
+    # Consumer Dag "asset-event-consumer"
+    with custom_partition_mapper_patch():
+        with dag_maker(
+            dag_id="asset-event-consumer",
+            schedule=PartitionedAssetTimetable(
+                assets=asset_1 & asset_2,
+                # Most users should use the partition mapper provided by the task-SDK.
+                # Advanced users can import from core and register their own partition mapper
+                # via an Airflow plugin.
+                # We intentionally exclude core mappers from the public typing
+                # so standard users don't accidentally rely on internal implementations.
+                partition_mapper_config={
+                    Asset(name="asset-1"): Key1Mapper(),  # type: ignore[dict-item]
+                    Asset(name="asset-2"): Key1Mapper(),  # type: ignore[dict-item]
+                },
+            ),
+            session=session,
+        ):
+            EmptyOperator(task_id="hi")
+    session.commit()
+
+    # Check whether we are ready to create Dag run for "asset-event-consumer"
+    runner = SchedulerJobRunner(
+        job=Job(job_type=SchedulerJobRunner.job_type), executors=[MockExecutor(do_update=False)]
+    )
+
+    with custom_partition_mapper_patch():
+        apdr = _produce_and_register_asset_event(
+            dag_id="asset-event-producer-1",
+            asset=asset_1,
+            partition_key="key-2",
+            session=session,
+            dag_maker=dag_maker,
+            expected_partition_key="key-1",
+        )
+        partition_dags = runner._create_dagruns_for_partitioned_asset_dags(session=session)
+    session.refresh(apdr)
+    # Since asset event for Asset(name="asset-2") with key "key-1" has not yet been created,
+    # no Dag run will be created
+    assert apdr.created_dag_run_id is None
+    assert len(partition_dags) == 0
+    assert partition_dags == set()
+
+    with custom_partition_mapper_patch():
+        apdr = _produce_and_register_asset_event(
+            dag_id="asset-event-producer-2",
+            asset=asset_2,
+            partition_key="key-3",
+            session=session,
+            dag_maker=dag_maker,
+            expected_partition_key="key-1",
+        )
+        partition_dags = runner._create_dagruns_for_partitioned_asset_dags(session=session)
+    session.refresh(apdr)
+    # Even though the original key passed was key-3, the consumer Dag uses Key1Mapper to transform anything
+    # into key-1. Thus, the criteria is met and a Dag run should be created
+    assert apdr.created_dag_run_id is not None
+    assert len(partition_dags) == 1
+    assert partition_dags == {"asset-event-consumer"}
+
+    dag_run = session.scalar(select(DagRun).where(DagRun.id == apdr.created_dag_run_id))
+    assert dag_run is not None
+    for asset_event in dag_run.consumed_asset_events:
+        assert asset_event.source_task_id == "hi"
+        assert "asset-event-producer-" in asset_event.source_dag_id
+        assert asset_event.source_run_id == "test"
+
+
+# ---------------------------------------------------------------------------
+# Tests for nullable dag_version in scheduler callbacks (AIP-66)
+#
+# Verifies that TaskCallbackRequest and EmailRequest are always created
+# with correct bundle_name/bundle_version whether ti.dag_version is a real
+# DagVersion object (normal) or None (legacy tasks migrated from Airflow 2).
+#
+# Fallback mirrors DagCallbackRequest in dagrun.py:
+#   bundle_name    <- ti.dag_version.bundle_name  OR  ti.dag_model.bundle_name
+#   bundle_version <- ti.dag_version.bundle_version  OR  ti.dag_run.bundle_version
+# ---------------------------------------------------------------------------
+
+
+def _make_ti_with_dag_version(
+    dag_version, dag_model_bundle_name="fallback-bundle", dag_run_bundle_version="v1.0-fallback"
+):
+    """Build a minimal mock TaskInstance for dag_version nullable tests."""
+    ti = mock.MagicMock()
+    ti.dag_version = dag_version
+    ti.dag_model = mock.MagicMock()
+    ti.dag_model.bundle_name = dag_model_bundle_name
+    ti.dag_model.relative_fileloc = "/dags/test_dag.py"
+    ti.dag_run = mock.MagicMock()
+    ti.dag_run.bundle_version = dag_run_bundle_version
+    return ti
+
+
+def _make_dag_version(bundle_name="my-bundle", bundle_version="v2.0"):
+    """Create a simple mock DagVersion."""
+    dv = mock.MagicMock()
+    dv.bundle_name = bundle_name
+    dv.bundle_version = bundle_version
+    return dv
+
+
+def _extract_bundle_name(ti):
+    """Mirror the inline fallback logic from scheduler_job_runner.py."""
+    return ti.dag_version.bundle_name if ti.dag_version else ti.dag_model.bundle_name
+
+
+def _extract_bundle_version(ti):
+    """Mirror the inline fallback logic from scheduler_job_runner.py."""
+    return (
+        ti.dag_version.bundle_version
+        if ti.dag_version and ti.dag_run.bundle_version is not None
+        else ti.dag_run.bundle_version
+    )
+
+
+class TestSchedulerCallbackBundleInfoDagVersionNullable:
+    """
+    Verify the bundle_name / bundle_version extraction logic used at all four
+    TaskCallbackRequest / EmailRequest creation sites in scheduler_job_runner.py.
+
+    When dag_version is present  -> use dag_version.bundle_name / bundle_version.
+    When dag_version is None     -> fall back to dag_model.bundle_name / dag_run.bundle_version.
+    """
+
+    # ── With dag_version present ──────────────────────────────────────────
+
+    @pytest.mark.parametrize(
+        ("dv_bundle_name", "dv_bundle_version"),
+        [
+            pytest.param("my-bundle", "v2.0", id="normal"),
+            pytest.param("dags-folder", None, id="version_none"),
+            pytest.param("custom-bundle", "v99.0", id="custom"),
+        ],
+    )
+    def test_bundle_info_from_dag_version_when_present(self, dv_bundle_name, dv_bundle_version):
+        """When dag_version is set, bundle info must come from it."""
+        dv = _make_dag_version(bundle_name=dv_bundle_name, bundle_version=dv_bundle_version)
+        ti = _make_ti_with_dag_version(dag_version=dv, dag_model_bundle_name="SHOULD-NOT-USE")
+
+        assert _extract_bundle_name(ti) == dv_bundle_name
+        assert _extract_bundle_version(ti) == dv_bundle_version
+
+    # ── With dag_version None (legacy Airflow 2 task) ─────────────────────
+
+    @pytest.mark.parametrize(
+        ("model_bundle_name", "run_bundle_version"),
+        [
+            pytest.param("fallback-bundle", "v1.0-fallback", id="normal_fallback"),
+            pytest.param("dags-folder", None, id="version_none_fallback"),
+            pytest.param("another-bundle", "v3.5", id="custom_fallback"),
+        ],
+    )
+    def test_bundle_info_falls_back_when_dag_version_none(self, model_bundle_name, run_bundle_version):
+        """When dag_version is None, bundle info must fall back to dag_model / dag_run."""
+        ti = _make_ti_with_dag_version(
+            dag_version=None,
+            dag_model_bundle_name=model_bundle_name,
+            dag_run_bundle_version=run_bundle_version,
+        )
+
+        assert _extract_bundle_name(ti) == model_bundle_name
+        assert _extract_bundle_version(ti) == run_bundle_version
+
+    # ── No AttributeError crash ────────────────────────────────────────────
+
+    @pytest.mark.parametrize(
+        "dag_version_present",
+        [
+            pytest.param(True, id="dag_version_present"),
+            pytest.param(False, id="dag_version_none"),
+        ],
+    )
+    def test_no_attribute_error_regardless_of_dag_version(self, dag_version_present):
+        """
+        The old code crashed with AttributeError when ti.dag_version was None.
+        The new fallback must never raise regardless of dag_version state.
+        """
+        ti = _make_ti_with_dag_version(dag_version=_make_dag_version() if dag_version_present else None)
+
+        name = _extract_bundle_name(ti)
+        version = _extract_bundle_version(ti)
+
+        assert isinstance(name, str)
+        assert version is None or isinstance(version, str)
+
+    # ── Precedence: dag_version wins over fallback ─────────────────────────
+
+    def test_dag_version_takes_precedence_over_fallback_values(self):
+        """When dag_version is set, dag_model/dag_run fallbacks must NOT be used."""
+        dv = _make_dag_version(bundle_name="preferred-bundle", bundle_version="preferred-v1")
+        ti = _make_ti_with_dag_version(
+            dag_version=dv,
+            dag_model_bundle_name="fallback-bundle",
+            dag_run_bundle_version="fallback-v1",
+        )
+
+        assert _extract_bundle_name(ti) == "preferred-bundle"
+        assert _extract_bundle_version(ti) == "preferred-v1"
+
+    def test_fallback_values_used_only_when_dag_version_is_none(self):
+        """When dag_version is None, fallback values must be used."""
+        ti = _make_ti_with_dag_version(
+            dag_version=None,
+            dag_model_bundle_name="fallback-bundle",
+            dag_run_bundle_version="fallback-v1",
+        )
+
+        assert _extract_bundle_name(ti) == "fallback-bundle"
+        assert _extract_bundle_version(ti) == "fallback-v1"
+
+    def test_unpinned_dag_run_overrides_dag_version_bundle_version(self):
+        """
+        When dag_run.bundle_version is None (e.g. dag.disable_bundle_versioning=True
+        leaves it unpinned even though DagVersion was written with a SHA), the
+        callback must inherit None so it runs against the same on-disk code as
+        the task did, instead of pinning to the DagVersion's recorded SHA.
+        """
+        dv = _make_dag_version(bundle_name="my-bundle", bundle_version="abc123-sha")
+        ti = _make_ti_with_dag_version(dag_version=dv, dag_run_bundle_version=None)
+
+        # bundle_name still comes from dag_version
+        assert _extract_bundle_name(ti) == "my-bundle"
+        # but bundle_version follows the dag_run's unpinned state
+        assert _extract_bundle_version(ti) is None

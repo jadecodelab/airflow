@@ -27,15 +27,22 @@ from rich.console import Console
 from testcontainers.compose import DockerCompose
 
 from airflow_e2e_tests.constants import (
+    AIRFLOW_SERVICES_FOR_PROVIDER_MOUNT,
     AWS_INIT_PATH,
     DOCKER_COMPOSE_HOST_PORT,
     DOCKER_COMPOSE_PATH,
     DOCKER_IMAGE,
     E2E_DAGS_FOLDER,
     E2E_TEST_MODE,
+    ELASTICSEARCH_PATH,
+    KAFKA_DIR_PATH,
     LOCALSTACK_PATH,
     LOGS_FOLDER,
+    OPENSEARCH_PATH,
+    PROVIDERS_MOUNT_CONTAINER_PATH,
+    PROVIDERS_ROOT_PATH,
     TEST_REPORT_FILE,
+    XCOM_BUCKET,
 )
 
 from tests_common.test_utils.fernet import generate_fernet_key_string
@@ -48,12 +55,27 @@ class _E2ETestState:
     airflow_logs_path: Path | None = None
 
 
-def _setup_s3_integration(dot_env_file, tmp_dir):
+def _copy_localstack_files(tmp_dir):
+    """Copy localstack compose file and init script into the temp directory."""
     copyfile(LOCALSTACK_PATH, tmp_dir / "localstack.yml")
 
     copyfile(AWS_INIT_PATH, tmp_dir / "init-aws.sh")
     current_permissions = os.stat(tmp_dir / "init-aws.sh").st_mode
     os.chmod(tmp_dir / "init-aws.sh", current_permissions | 0o111)
+
+
+def _copy_elasticsearch_files(tmp_dir):
+    """Copy Elasticsearch compose file into the temp directory."""
+    copyfile(ELASTICSEARCH_PATH, tmp_dir / "elasticsearch.yml")
+
+
+def _copy_opensearch_files(tmp_dir):
+    """Copy OpenSearch compose file into the temp directory."""
+    copyfile(OPENSEARCH_PATH, tmp_dir / "opensearch.yml")
+
+
+def _setup_s3_integration(dot_env_file, tmp_dir):
+    _copy_localstack_files(tmp_dir)
 
     dot_env_file.write_text(
         f"AIRFLOW_UID={os.getuid()}\n"
@@ -68,8 +90,152 @@ def _setup_s3_integration(dot_env_file, tmp_dir):
     os.environ["ENV_FILE_PATH"] = str(dot_env_file)
 
 
+def _setup_elasticsearch_integration(dot_env_file, tmp_dir):
+    _copy_elasticsearch_files(tmp_dir)
+
+    dot_env_file.write_text(
+        f"AIRFLOW_UID={os.getuid()}\n"
+        "AIRFLOW__LOGGING__REMOTE_LOGGING=true\n"
+        "AIRFLOW__ELASTICSEARCH__HOST=http://elasticsearch:9200\n"
+        "AIRFLOW__ELASTICSEARCH__WRITE_STDOUT=false\n"
+        "AIRFLOW__ELASTICSEARCH__JSON_FORMAT=true\n"
+        "AIRFLOW__ELASTICSEARCH__WRITE_TO_ES=true\n"
+        "AIRFLOW__ELASTICSEARCH__TARGET_INDEX=airflow-e2e-logs\n"
+    )
+    os.environ["ENV_FILE_PATH"] = str(dot_env_file)
+
+
+def _setup_opensearch_integration(dot_env_file, tmp_dir):
+    _copy_opensearch_files(tmp_dir)
+
+    dot_env_file.write_text(
+        f"AIRFLOW_UID={os.getuid()}\n"
+        "AIRFLOW__LOGGING__REMOTE_LOGGING=true\n"
+        "AIRFLOW__OPENSEARCH__HOST=http://opensearch:9200\n"
+        "AIRFLOW__OPENSEARCH__PORT=9200\n"
+        "AIRFLOW__OPENSEARCH__USERNAME=admin\n"
+        "AIRFLOW__OPENSEARCH__PASSWORD=admin\n"
+        "AIRFLOW__OPENSEARCH__WRITE_STDOUT=false\n"
+        "AIRFLOW__OPENSEARCH__JSON_FORMAT=true\n"
+        "AIRFLOW__OPENSEARCH__WRITE_TO_OS=true\n"
+        "AIRFLOW__OPENSEARCH__TARGET_INDEX=airflow-e2e-logs\n"
+        "AIRFLOW__OPENSEARCH__HOST_FIELD=host\n"
+        "AIRFLOW__OPENSEARCH__OFFSET_FIELD=offset\n"
+    )
+    os.environ["ENV_FILE_PATH"] = str(dot_env_file)
+
+
+def _copy_kafka_files(tmp_dir):
+    """Copy the Kafka compose file and broker init script into the temp directory."""
+    copyfile(KAFKA_DIR_PATH.parent / "kafka.yml", tmp_dir / "kafka.yml")
+
+    kafka_dir = tmp_dir / "kafka"
+    kafka_dir.mkdir()
+    copyfile(KAFKA_DIR_PATH / "update_run.sh", kafka_dir / "update_run.sh")
+    current_permissions = os.stat(kafka_dir / "update_run.sh").st_mode
+    os.chmod(kafka_dir / "update_run.sh", current_permissions | 0o111)
+
+
+def _write_providers_mount_override(tmp_dir: Path, providers: list[str]) -> list[str]:
+    """Write a docker-compose override that bind-mounts in-tree provider sources.
+
+    Each entry in ``providers`` is a provider id with dot-separated path segments (e.g.
+    ``"apache.kafka"``). The host source ``providers/<dotted/as/slashes>`` is mounted
+    read-only into every airflow service at ``<PROVIDERS_MOUNT_CONTAINER_PATH>/<dashed>``.
+    Returns the list of in-container paths suitable for ``_PIP_ADDITIONAL_REQUIREMENTS``
+    so pip installs the in-tree (latest, possibly unreleased) provider instead of the
+    PyPI release.
+    """
+    in_container_paths: list[str] = []
+    volume_entries: list[str] = []
+    for provider_id in providers:
+        host_path = PROVIDERS_ROOT_PATH / provider_id.replace(".", "/")
+        if not host_path.is_dir():
+            raise RuntimeError(f"Provider source directory not found: {host_path}")
+        container_path = f"{PROVIDERS_MOUNT_CONTAINER_PATH}/{provider_id.replace('.', '-')}"
+        in_container_paths.append(container_path)
+        volume_entries.append(f"      - {host_path}:{container_path}:ro")
+
+    volumes_block = "\n".join(volume_entries)
+    services_block = "\n".join(
+        f"  {svc}:\n    volumes:\n{volumes_block}" for svc in AIRFLOW_SERVICES_FOR_PROVIDER_MOUNT
+    )
+    (tmp_dir / "providers-mount.yml").write_text(f"---\nservices:\n{services_block}\n")
+    return in_container_paths
+
+
+def _setup_event_driven_integration(dot_env_file, tmp_dir):
+    _copy_kafka_files(tmp_dir)
+
+    # Install kafka and common-messaging providers from the in-tree sources so the
+    # test exercises the latest code even before a PyPI release is cut.
+    provider_paths = _write_providers_mount_override(tmp_dir, ["apache.kafka", "common.messaging"])
+
+    kafka_conn = json.dumps(
+        {
+            "conn_type": "kafka",
+            "extra": {
+                "bootstrap.servers": "broker:29092",
+                "group.id": "kafka_default_group",
+                "security.protocol": "PLAINTEXT",
+                "enable.auto.commit": False,
+                "auto.offset.reset": "latest",
+            },
+        }
+    )
+
+    dot_env_file.write_text(
+        f"AIRFLOW_UID={os.getuid()}\n"
+        f"AIRFLOW_CONN_KAFKA_DEFAULT='{kafka_conn}'\n"
+        f"_PIP_ADDITIONAL_REQUIREMENTS={' '.join(provider_paths)}\n"
+    )
+    os.environ["ENV_FILE_PATH"] = str(dot_env_file)
+
+
+def _create_kafka_topics(compose_instance):
+    """Create Kafka topics required by the event-driven Dag."""
+    for topic in ("fizz_buzz", "dlq"):
+        compose_instance.exec_in_container(
+            command=[
+                "kafka-topics",
+                "--bootstrap-server",
+                "broker:29092",
+                "--create",
+                "--topic",
+                topic,
+                "--partitions",
+                "1",
+                "--replication-factor",
+                "1",
+                "--if-not-exists",
+            ],
+            service_name="broker",
+        )
+
+
+def _setup_xcom_object_storage_integration(dot_env_file, tmp_dir):
+    _copy_localstack_files(tmp_dir)
+
+    dot_env_file.write_text(
+        f"AIRFLOW_UID={os.getuid()}\n"
+        # XComObjectStorageBackend requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY as env vars
+        # because `universal-path` uses boto3's native S3 client, which relies on environment variables
+        # for authentication rather than parsing credentials from the connection URI
+        "AWS_ACCESS_KEY_ID=test\n"
+        "AWS_SECRET_ACCESS_KEY=test\n"
+        "AWS_DEFAULT_REGION=us-east-1\n"
+        "AWS_ENDPOINT_URL_S3=http://localstack:4566\n"
+        "AIRFLOW_CONN_AWS_DEFAULT=aws://test:test@\n"
+        "AIRFLOW__CORE__XCOM_BACKEND=airflow.providers.common.io.xcom.backend.XComObjectStorageBackend\n"
+        f"AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_PATH=s3://aws_default@{XCOM_BUCKET}/xcom\n"
+        "AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_THRESHOLD=0\n"
+        "_PIP_ADDITIONAL_REQUIREMENTS=apache-airflow-providers-amazon[s3fs]\n"
+    )
+    os.environ["ENV_FILE_PATH"] = str(dot_env_file)
+
+
 def spin_up_airflow_environment(tmp_path_factory: pytest.TempPathFactory):
-    tmp_dir = tmp_path_factory.mktemp("airflow-e2e-tests")
+    tmp_dir = tmp_path_factory.mktemp("breeze-airflow-e2e-tests")
 
     console.print(f"[yellow]Using docker compose file: {DOCKER_COMPOSE_PATH}")
     copyfile(DOCKER_COMPOSE_PATH, tmp_dir / "docker-compose.yaml")
@@ -97,6 +263,18 @@ def spin_up_airflow_environment(tmp_path_factory: pytest.TempPathFactory):
     if E2E_TEST_MODE == "remote_log":
         compose_file_names.append("localstack.yml")
         _setup_s3_integration(dot_env_file, tmp_dir)
+    elif E2E_TEST_MODE == "remote_log_elasticsearch":
+        compose_file_names.append("elasticsearch.yml")
+        _setup_elasticsearch_integration(dot_env_file, tmp_dir)
+    elif E2E_TEST_MODE == "remote_log_opensearch":
+        compose_file_names.append("opensearch.yml")
+        _setup_opensearch_integration(dot_env_file, tmp_dir)
+    elif E2E_TEST_MODE == "xcom_object_storage":
+        compose_file_names.append("localstack.yml")
+        _setup_xcom_object_storage_integration(dot_env_file, tmp_dir)
+    elif E2E_TEST_MODE == "event_driven":
+        compose_file_names.extend(["kafka.yml", "providers-mount.yml"])
+        _setup_event_driven_integration(dot_env_file, tmp_dir)
 
     #
     # Please Do not use this Fernet key in any deployments! Please generate your own key.
@@ -104,9 +282,9 @@ def spin_up_airflow_environment(tmp_path_factory: pytest.TempPathFactory):
     #
     os.environ["FERNET_KEY"] = generate_fernet_key_string()
 
-    # If we are using the image from ghcr.io/apache/airflow/main we do not pull
+    # If we are using the image from ghcr.io/apache/airflow we do not pull
     # as it is already available and loaded using prepare_breeze_and_image step in workflow
-    pull = False if DOCKER_IMAGE.startswith("ghcr.io/apache/airflow/main/") else True
+    pull = False if DOCKER_IMAGE.startswith("ghcr.io/apache/airflow/") else True
 
     try:
         console.print(f"[blue]Spinning up airflow environment using {DOCKER_IMAGE}")
@@ -120,6 +298,10 @@ def spin_up_airflow_environment(tmp_path_factory: pytest.TempPathFactory):
         _E2ETestState.compose_instance.exec_in_container(
             command=["airflow", "dags", "reserialize"], service_name="airflow-dag-processor"
         )
+
+        if E2E_TEST_MODE == "event_driven":
+            console.print("[yellow]Creating Kafka topics...")
+            _create_kafka_topics(_E2ETestState.compose_instance)
 
     except Exception:
         console.print("[red]Failed to start docker compose")
@@ -136,7 +318,7 @@ def _print_logs(compose_instance: DockerCompose):
         if service:
             stdout, _ = compose_instance.get_logs(service)
             console.print(f"::group:: {service} Logs")
-            console.print(f"[red]{stdout}")
+            console.print(stdout, style="red", soft_wrap=True, markup=False)
             console.print("::endgroup::")
 
 
@@ -180,6 +362,12 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int | pytest.ExitC
             _print_logs(_E2ETestState.compose_instance)
         if not os.environ.get("SKIP_DOCKER_COMPOSE_DELETION"):
             _E2ETestState.compose_instance.stop()
+
+
+@pytest.fixture(scope="session")
+def compose_instance():
+    """Provide access to the running Docker Compose instance."""
+    return _E2ETestState.compose_instance
 
 
 def generate_test_report(results):

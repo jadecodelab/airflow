@@ -22,7 +22,9 @@ import { useEffect, useState } from "react";
 import { Controller, useForm, useWatch } from "react-hook-form";
 import { useTranslation } from "react-i18next";
 
+import { useDagServiceGetDagDetails } from "openapi/queries";
 import type { BackfillPostBody, DAGResponse, DAGWithLatestDagRunsResponse } from "openapi/requests/types.gen";
+import { useRerunWithLatestVersion } from "src/components/Clear/useRerunWithLatestVersion";
 import { RadioCardItem, RadioCardLabel, RadioCardRoot } from "src/components/ui/RadioCard";
 import { reprocessBehaviors } from "src/constants/reprocessBehaviourParams";
 import { useCreateBackfill } from "src/queries/useCreateBackfill";
@@ -33,8 +35,9 @@ import { useTogglePause } from "src/queries/useTogglePause";
 
 import ConfigForm from "../ConfigForm";
 import { DateTimeInput } from "../DateTimeInput";
-import { ErrorAlert } from "../ErrorAlert";
-import type { DagRunTriggerParams } from "../TriggerDag/TriggerDAGForm";
+import { ErrorAlert, type ExpandedApiError } from "../ErrorAlert";
+import type { DagRunTriggerParams } from "../TriggerDag/types";
+import { Alert } from "../ui";
 import { Checkbox } from "../ui/Checkbox";
 import { getInlineMessage } from "./inlineMessage";
 
@@ -49,26 +52,37 @@ const RunBackfillForm = ({ dag, onClose }: RunBackfillFormProps) => {
   const { t: translate } = useTranslation(["components", "common"]);
   const [errors, setErrors] = useState<{ conf?: string; date?: unknown }>({});
   const [unpause, setUnpause] = useState(true);
+  const [overrideParams, setOverrideParams] = useState(false);
   const [formError, setFormError] = useState(false);
   const initialParamsDict = useDagParams(dag.dag_id, true);
   const { conf } = useParamStore();
+  const { data: dagDetails } = useDagServiceGetDagDetails({ dagId: dag.dag_id });
+  const { value: resolvedRunOnLatest } = useRerunWithLatestVersion({
+    dagLevelConfig: dagDetails?.rerun_with_latest_version,
+    fallback: true,
+  });
   const { control, handleSubmit, reset, watch } = useForm<BackfillFormProps>({
-    defaultValues: {
+    mode: "onBlur",
+    resetOptions: { keepDirtyValues: true },
+    values: {
       conf,
       dag_id: dag.dag_id,
       from_date: "",
       max_active_runs: 1,
       reprocess_behavior: "none",
       run_backwards: false,
-      run_on_latest_version: true,
+      run_on_latest_version: resolvedRunOnLatest,
       to_date: "",
-    },
-    mode: "onBlur",
+    } as BackfillFormProps,
   });
   const values = useWatch<BackfillFormProps>({
     control,
   });
-  const { data, isPending: isPendingDryRun } = useCreateBackfillDryRun({
+  const {
+    data,
+    error: dryRunError,
+    isPending: isPendingDryRun,
+  } = useCreateBackfillDryRun({
     requestBody: {
       requestBody: {
         dag_id: dag.dag_id,
@@ -77,7 +91,7 @@ const RunBackfillForm = ({ dag, onClose }: RunBackfillFormProps) => {
         max_active_runs: values.max_active_runs ?? 1,
         reprocess_behavior: values.reprocess_behavior,
         run_backwards: values.run_backwards ?? false,
-        run_on_latest_version: values.run_on_latest_version ?? true,
+        run_on_latest_version: values.run_on_latest_version,
         to_date: values.to_date ?? "",
       },
     },
@@ -114,7 +128,7 @@ const RunBackfillForm = ({ dag, onClose }: RunBackfillFormProps) => {
     createBackfill({
       requestBody: {
         ...fdata,
-        dag_run_conf: JSON.parse(fdata.conf) as Record<string, unknown>,
+        dag_run_conf: overrideParams ? (JSON.parse(fdata.conf) as Record<string, unknown>) : null,
       },
     });
   };
@@ -123,13 +137,23 @@ const RunBackfillForm = ({ dag, onClose }: RunBackfillFormProps) => {
     reset(fdata);
     onClose();
   };
+
   const resetDateError = () => setErrors((prev) => ({ ...prev, date: undefined }));
   const affectedTasks = data ?? { backfills: [], total_entries: 0 };
+
+  // Check if the dry run error is a permission error (403)
+  const isPermissionError =
+    dryRunError !== undefined && dryRunError !== null && (dryRunError as ExpandedApiError).status === 403;
+
   const inlineMessage = getInlineMessage(isPendingDryRun, affectedTasks.total_entries, translate);
 
   return (
     <>
-      <ErrorAlert error={errors.date ?? error} />
+      {isPermissionError ? (
+        <Alert status="error">{translate("backfill.permissionDenied")}</Alert>
+      ) : (
+        <ErrorAlert error={errors.date ?? dryRunError ?? error} />
+      )}
       <VStack alignItems="stretch" gap={2} pt={4}>
         <Box>
           <Text fontSize="md" fontWeight="semibold" mb={3}>
@@ -159,7 +183,7 @@ const RunBackfillForm = ({ dag, onClose }: RunBackfillFormProps) => {
             />
           </HStack>
         </Box>
-        {noDataInterval || dataIntervalInvalid ? undefined : <Box>{inlineMessage}</Box>}
+        {noDataInterval || dataIntervalInvalid || isPermissionError ? undefined : <Box>{inlineMessage}</Box>}
         <Spacer />
         <Controller
           control={control}
@@ -172,7 +196,6 @@ const RunBackfillForm = ({ dag, onClose }: RunBackfillFormProps) => {
               <HStack align="stretch">
                 {reprocessBehaviors.map((item) => (
                   <RadioCardItem
-                    colorPalette="brand"
                     indicatorPlacement="start"
                     key={item.value}
                     label={translate(item.label)}
@@ -206,7 +229,7 @@ const RunBackfillForm = ({ dag, onClose }: RunBackfillFormProps) => {
           control={control}
           name="run_backwards"
           render={({ field }) => (
-            <Checkbox checked={field.value} colorPalette="brand" onChange={field.onChange}>
+            <Checkbox checked={field.value} onChange={field.onChange}>
               {translate("backfill.backwards")}
             </Checkbox>
           )}
@@ -216,7 +239,7 @@ const RunBackfillForm = ({ dag, onClose }: RunBackfillFormProps) => {
           control={control}
           name="run_on_latest_version"
           render={({ field }) => (
-            <Checkbox checked={field.value} colorPalette="brand" onChange={field.onChange}>
+            <Checkbox checked={field.value ?? undefined} colorPalette="brand" onChange={field.onChange}>
               {translate("dags:runAndTaskActions.options.runOnLatestVersion")}
             </Checkbox>
           )}
@@ -224,17 +247,16 @@ const RunBackfillForm = ({ dag, onClose }: RunBackfillFormProps) => {
         <Spacer />
         {dag.is_paused ? (
           <>
-            <Checkbox
-              checked={unpause}
-              colorPalette="brand"
-              onChange={() => setUnpause(!unpause)}
-              wordBreak="break-all"
-            >
+            <Checkbox checked={unpause} onChange={() => setUnpause(!unpause)} wordBreak="break-all">
               {translate("backfill.unpause", { dag_display_name: dag.dag_display_name })}
             </Checkbox>
             <Spacer />
           </>
         ) : undefined}
+        <Checkbox checked={overrideParams} onChange={() => setOverrideParams(!overrideParams)}>
+          {translate("backfill.overrideExistingParams")}
+        </Checkbox>
+        <Spacer />
         <ConfigForm
           control={control}
           errors={errors}
@@ -248,7 +270,6 @@ const RunBackfillForm = ({ dag, onClose }: RunBackfillFormProps) => {
           <Spacer />
           <Button onClick={() => void handleSubmit(onCancel)()}>{translate("common:modal.cancel")}</Button>
           <Button
-            colorPalette="brand"
             disabled={
               Boolean(errors.date) || isPendingDryRun || formError || affectedTasks.total_entries === 0
             }

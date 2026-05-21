@@ -17,9 +17,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from unittest import mock
 
 import pytest
 
+from airflow.api_fastapi.auth.managers.models.resource_details import DagAccessEntity, DagDetails
 from airflow.models.log import Log
 from airflow.utils.session import provide_session
 
@@ -196,6 +198,40 @@ class TestGetEventLog(TestEventLogsEndpoint):
         response = unauthorized_test_client.get(f"/eventLogs/{event_log_id}")
         assert response.status_code == 403
 
+    def test_should_respond_403_when_user_lacks_dag_audit_log_permission(self, test_client, setup):
+        """The detail endpoint must enforce the per-DAG audit log permission of the event log's dag_id."""
+        event_log_id = setup[TASK_INSTANCE_EVENT].id
+        with mock.patch(
+            "airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager.is_authorized_dag",
+            return_value=False,
+        ) as mock_is_authorized_dag:
+            response = test_client.get(f"/eventLogs/{event_log_id}")
+
+        assert response.status_code == 403
+        mock_is_authorized_dag.assert_called_once_with(
+            method="GET",
+            access_entity=DagAccessEntity.AUDIT_LOG,
+            details=DagDetails(id=DAG_ID, team_name=None),
+            user=mock.ANY,
+        )
+
+    def test_should_authorize_with_event_log_dag_id(self, test_client, setup):
+        """When the event log is bound to a DAG, authorization must scope to that DAG id."""
+        event_log_id = setup[TASK_INSTANCE_EVENT].id
+        with mock.patch(
+            "airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager.is_authorized_dag",
+            return_value=True,
+        ) as mock_is_authorized_dag:
+            response = test_client.get(f"/eventLogs/{event_log_id}")
+
+        assert response.status_code == 200
+        mock_is_authorized_dag.assert_called_once_with(
+            method="GET",
+            access_entity=DagAccessEntity.AUDIT_LOG,
+            details=DagDetails(id=DAG_ID, team_name=None),
+            user=mock.ANY,
+        )
+
 
 class TestGetEventLogs(TestEventLogsEndpoint):
     @pytest.mark.parametrize(
@@ -302,7 +338,7 @@ class TestGetEventLogs(TestEventLogsEndpoint):
     def test_get_event_logs(
         self, test_client, query_params, expected_status_code, expected_total_entries, expected_events
     ):
-        with assert_queries_count(2):
+        with assert_queries_count(3):
             response = test_client.get("/eventLogs", params=query_params)
         assert response.status_code == expected_status_code
         if expected_status_code != 200:
@@ -341,7 +377,7 @@ class TestGetEventLogs(TestEventLogsEndpoint):
     def test_get_event_logs_order_by(
         self, test_client, query_params, expected_status_code, expected_total_entries, expected_events
     ):
-        with assert_queries_count(2):
+        with assert_queries_count(3):
             response = test_client.get("/eventLogs", params=query_params)
         assert response.status_code == expected_status_code
         if expected_status_code != 200:

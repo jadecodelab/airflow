@@ -30,7 +30,11 @@ if TYPE_CHECKING:
 
     from airflow.sdk.bases.operator import BaseOperator
     from airflow.sdk.definitions.dag import DAG
-    from airflow.sdk.execution_time.context import InletEventsAccessors
+    from airflow.sdk.execution_time.context import (
+        AssetStateAccessors,
+        InletEventsAccessors,
+        TaskStateAccessor,
+    )
     from airflow.sdk.types import (
         DagRunProtocol,
         Operator,
@@ -59,19 +63,21 @@ class Context(TypedDict, total=False):
     map_index_template: NotRequired[str | None]
     outlets: list
     params: dict[str, Any]
+    partition_key: NotRequired[str | None]
     prev_data_interval_start_success: NotRequired[DateTime | None]
     prev_data_interval_end_success: NotRequired[DateTime | None]
     prev_start_date_success: NotRequired[DateTime | None]
     prev_end_date_success: NotRequired[DateTime | None]
     reason: NotRequired[str | None]
     run_id: str
-    start_date: DateTime
     # TODO: Remove Operator from below once we have MappedOperator to the Task SDK
     #   and once we can remove context related code from the Scheduler/models.TaskInstance
     task: BaseOperator | Operator
     task_reschedule_count: int
     task_instance: RuntimeTaskInstanceProtocol
     task_instance_key_str: str
+    task_state: TaskStateAccessor
+    asset_state: AssetStateAccessors
     # `templates_dict` is only set in PythonOperator
     templates_dict: NotRequired[dict[str, Any] | None]
     test_mode: bool

@@ -31,12 +31,15 @@ from typing import TYPE_CHECKING, Any, Literal
 import pluggy
 from packaging.version import Version
 from sqlalchemy import create_engine
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession as SAAsyncSession,
     create_async_engine,
 )
 from sqlalchemy.orm import scoped_session, sessionmaker
+
+from airflow._shared.observability.traces import configure_otel
 
 try:
     from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -56,15 +59,13 @@ from airflow.configuration import AIRFLOW_HOME, conf
 from airflow.exceptions import AirflowInternalRuntimeError
 from airflow.logging_config import configure_logging
 from airflow.utils.orm_event_handlers import setup_event_handlers
-from airflow.utils.sqlalchemy import is_sqlalchemy_v1
 
 _USE_PSYCOPG3: bool
 try:
     from importlib.util import find_spec
 
-    is_psycopg3 = find_spec("psycopg") is not None
+    _USE_PSYCOPG3 = find_spec("psycopg") is not None
 
-    _USE_PSYCOPG3 = is_psycopg3 and not is_sqlalchemy_v1()
 except (ImportError, ModuleNotFoundError):
     _USE_PSYCOPG3 = False
 
@@ -349,6 +350,48 @@ def _get_connect_args(mode: Literal["sync", "async"]) -> Any:
     return {}
 
 
+def create_metadata_engine(
+    sql_alchemy_conn: str,
+    *,
+    engine_args: dict[str, Any],
+    connect_args: dict[str, Any],
+) -> Engine:
+    """
+    Create the SQLAlchemy Engine for the Airflow metadata database.
+
+    Override in ``airflow_local_settings.py`` to customize engine creation,
+    e.g. to register ``do_connect`` event handlers for token-based authentication.
+    """
+    return create_engine(
+        sql_alchemy_conn,
+        connect_args=connect_args,
+        **engine_args,
+        future=True,
+    )
+
+
+def create_async_metadata_engine(
+    sql_alchemy_conn_async: str,
+    *,
+    connect_args: dict[str, Any],
+    engine_args: dict[str, Any] | None = None,
+) -> AsyncEngine:
+    """
+    Create the async SQLAlchemy Engine for the Airflow metadata database.
+
+    Override in ``airflow_local_settings.py`` to customize async engine creation.
+    For ``do_connect`` handlers, register on ``engine.sync_engine``.
+
+    :param engine_args: Pool and engine configuration (pool_size, pool_recycle, etc.).
+    """
+    return create_async_engine(
+        sql_alchemy_conn_async,
+        connect_args=connect_args,
+        **(engine_args or {}),
+        future=True,
+    )
+
+
 def _configure_async_session() -> None:
     """
     Configure async SQLAlchemy session.
@@ -364,10 +407,23 @@ def _configure_async_session() -> None:
         AsyncSession = None
         return
 
-    async_engine = create_async_engine(
+    # Apply the same pool health settings used by the sync engine.
+    # Without these, the async pool uses SQLAlchemy defaults (pool_recycle=-1,
+    # pool_pre_ping=False) which means dead connections from PostgreSQL idle
+    # timeouts or pgbouncer disconnects are never detected.
+    engine_args: dict[str, Any] = {}
+    if not conf.getboolean("database", "SQL_ALCHEMY_POOL_ENABLED"):
+        engine_args["poolclass"] = NullPool
+    elif not SQL_ALCHEMY_CONN_ASYNC.startswith("sqlite"):
+        engine_args["pool_size"] = conf.getint("database", "SQL_ALCHEMY_POOL_SIZE", fallback=5)
+        engine_args["pool_recycle"] = conf.getint("database", "SQL_ALCHEMY_POOL_RECYCLE", fallback=1800)
+        engine_args["pool_pre_ping"] = conf.getboolean("database", "SQL_ALCHEMY_POOL_PRE_PING", fallback=True)
+        engine_args["max_overflow"] = conf.getint("database", "SQL_ALCHEMY_MAX_OVERFLOW", fallback=10)
+
+    async_engine = create_async_metadata_engine(
         SQL_ALCHEMY_CONN_ASYNC,
         connect_args=_get_connect_args("async"),
-        future=True,
+        engine_args=engine_args,
     )
     AsyncSession = async_sessionmaker(
         bind=async_engine,
@@ -408,11 +464,10 @@ def configure_orm(disable_connection_pool=False, pool_class=None):
         # to so the `test` thread and the tested endpoints can use common objects.
         connect_args["check_same_thread"] = False
 
-    engine = create_engine(
+    engine = create_metadata_engine(
         SQL_ALCHEMY_CONN,
+        engine_args=engine_args,
         connect_args=connect_args,
-        **engine_args,
-        future=True,
     )
     _configure_async_session()
     mask_secret(engine.url.password)
@@ -445,12 +500,26 @@ def configure_orm(disable_connection_pool=False, pool_class=None):
         register_at_fork(after_in_child=clean_in_fork)
 
 
+def _is_sqlite_in_memory(url: str) -> bool:
+    """
+    Check if a SQLAlchemy connection URL points to an in-memory SQLite database.
+
+    Handles driver prefixes (e.g. ``sqlite+pysqlite://``), query parameters, and
+    various in-memory forms like ``:memory:`` and ``file::memory:``.
+    """
+    parsed = make_url(url)
+    if parsed.get_backend_name() != "sqlite":
+        return False
+    db = parsed.database
+    return not db or db == ":memory:" or ":memory:" in db
+
+
 def prepare_engine_args(disable_connection_pool=False, pool_class=None):
     """Prepare SQLAlchemy engine args."""
     DEFAULT_ENGINE_ARGS: dict[str, dict[str, Any]] = {
         "postgresql": (
             {
-                "executemany_values_page_size" if is_sqlalchemy_v1() else "insertmanyvalues_page_size": 10000,
+                "insertmanyvalues_page_size": 10000,
             }
             | (
                 {}
@@ -474,8 +543,12 @@ def prepare_engine_args(disable_connection_pool=False, pool_class=None):
     elif disable_connection_pool or not conf.getboolean("database", "SQL_ALCHEMY_POOL_ENABLED"):
         engine_args["poolclass"] = NullPool
         log.debug("settings.prepare_engine_args(): Using NullPool")
-    elif not SQL_ALCHEMY_CONN.startswith("sqlite"):
-        # Pool size engine args not supported by sqlite.
+    elif _is_sqlite_in_memory(SQL_ALCHEMY_CONN):
+        # In-memory SQLite uses SingletonThreadPool which doesn't support pool_size/max_overflow.
+        log.debug("settings.prepare_engine_args(): Skipping pool settings for in-memory SQLite")
+    else:
+        # Pool settings for all file-based databases including SQLite.
+        # SQLAlchemy 2.0+ uses QueuePool by default for file-based SQLite.
         # If no config value is defined for the pool size, select a reasonable value.
         # 0 means no limit, which could lead to exceeding the Database connection limit.
         pool_size = conf.getint("database", "SQL_ALCHEMY_POOL_SIZE", fallback=5)
@@ -502,7 +575,7 @@ def prepare_engine_args(disable_connection_pool=False, pool_class=None):
         # Typically, this is a simple statement like "SELECT 1", but may also make use
         # of some DBAPI-specific method to test the connection for liveness.
         # More information here:
-        # https://docs.sqlalchemy.org/en/14/core/pooling.html#disconnect-handling-pessimistic
+        # https://docs.sqlalchemy.org/en/20/core/pooling.html#disconnect-handling-pessimistic
         pool_pre_ping = conf.getboolean("database", "SQL_ALCHEMY_POOL_PRE_PING", fallback=True)
 
         log.debug(
@@ -526,21 +599,19 @@ def prepare_engine_args(disable_connection_pool=False, pool_class=None):
     if SQL_ALCHEMY_CONN.startswith("mysql"):
         engine_args["isolation_level"] = "READ COMMITTED"
 
-    if is_sqlalchemy_v1():
-        # Allow the user to specify an encoding for their DB otherwise default
-        # to utf-8 so jobs & users with non-latin1 characters can still use us.
-        # This parameter was removed in SQLAlchemy 2.x.
-        engine_args["encoding"] = conf.get("database", "SQL_ENGINE_ENCODING", fallback="utf-8")
-
     return engine_args
 
 
 def dispose_orm(do_log: bool = True):
     """Properly close pooled database connections."""
-    global Session, engine, NonScopedSession
+    global Session, engine, NonScopedSession, async_engine, AsyncSession
 
     _globals = globals()
-    if _globals.get("engine") is None and _globals.get("Session") is None:
+    if (
+        _globals.get("engine") is None
+        and _globals.get("Session") is None
+        and _globals.get("async_engine") is None
+    ):
         return
 
     if do_log:
@@ -557,6 +628,11 @@ def dispose_orm(do_log: bool = True):
     if "engine" in _globals and engine is not None:
         engine.dispose()
         engine = None
+
+    if "async_engine" in _globals and async_engine is not None:
+        async_engine.sync_engine.dispose()
+        async_engine = None
+        AsyncSession = None
 
 
 def reconfigure_orm(disable_connection_pool=False, pool_class=None):
@@ -730,7 +806,7 @@ def initialize():
     load_policy_plugins(policy_mgr)
     import_local_settings()
     configure_logging()
-
+    configure_otel(conf)
     configure_adapters()
     # The webservers import this file from models.py with the default settings.
 
@@ -762,3 +838,7 @@ LAZY_LOAD_PLUGINS: bool = conf.getboolean("core", "lazy_load_plugins", fallback=
 LAZY_LOAD_PROVIDERS: bool = conf.getboolean("core", "lazy_discover_providers", fallback=True)
 
 DAEMON_UMASK: str = conf.get("core", "daemon_umask", fallback="0o077")
+
+# Prefix used by gunicorn workers to indicate they are ready to serve requests
+# Used by GunicornMonitor to track worker readiness via process titles
+GUNICORN_WORKER_READY_PREFIX: str = "[ready] "

@@ -22,6 +22,7 @@ from __future__ import annotations
 import copy
 import re
 import weakref
+from collections import deque
 from collections.abc import Generator, Iterator, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -32,10 +33,12 @@ from airflow.sdk.definitions._internal.node import DAGNode, validate_group_key
 from airflow.sdk.exceptions import (
     AirflowDagCycleException,
     DuplicateTaskIdFound,
+    NodeNotFound,
     TaskAlreadyInTaskGroup,
 )
 
 if TYPE_CHECKING:
+    from airflow.sdk.api.datamodels._generated import DagAttributeTypes
     from airflow.sdk.bases.operator import BaseOperator
     from airflow.sdk.definitions._internal.abstractoperator import AbstractOperator
     from airflow.sdk.definitions._internal.expandinput import DictOfListsExpandInput, ListOfDictsExpandInput
@@ -43,7 +46,6 @@ if TYPE_CHECKING:
     from airflow.sdk.definitions.dag import DAG
     from airflow.sdk.definitions.edges import EdgeModifier
     from airflow.sdk.types import Operator
-    from airflow.serialization.enums import DagAttributeTypes
 
 
 def _default_parent_group() -> TaskGroup | None:
@@ -491,9 +493,15 @@ class TaskGroup(DAGNode):
         """Get a child task/TaskGroup by its label (i.e. task_id/group_id without the group_id prefix)."""
         return self.children[self.child_id(label)]
 
+    def __getitem__(self, label: str) -> DAGNode:
+        try:
+            return self.get_child_by_label(label)
+        except KeyError:
+            raise NodeNotFound(f"Task {label!r} not found")
+
     def serialize_for_task_group(self) -> tuple[DagAttributeTypes, Any]:
         """Serialize task group; required by DagNode."""
-        from airflow.serialization.enums import DagAttributeTypes
+        from airflow.sdk.api.datamodels._generated import DagAttributeTypes
         from airflow.serialization.serialized_objects import TaskGroupSerialization
 
         return (
@@ -586,10 +594,10 @@ class TaskGroup(DAGNode):
         """Return an iterator of the child tasks."""
         from airflow.sdk.definitions._internal.abstractoperator import AbstractOperator
 
-        groups_to_visit = [self]
+        groups_to_visit = deque([self])
 
         while groups_to_visit:
-            visiting = groups_to_visit.pop(0)
+            visiting = groups_to_visit.popleft()
 
             for child in visiting.children.values():
                 if isinstance(child, AbstractOperator):

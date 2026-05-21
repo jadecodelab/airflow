@@ -16,20 +16,25 @@
 # under the License.
 from __future__ import annotations
 
+import json
 import os
 from importlib.metadata import PackageNotFoundError, metadata
 from unittest import mock
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from airflow.api_fastapi.core_api.datamodels.common import BulkActionResponse, BulkBody
+from airflow.api_fastapi.core_api.datamodels.connections import ConnectionBody
+from airflow.api_fastapi.core_api.services.public.connections import BulkConnectionService
 from airflow.models import Connection
 from airflow.secrets.environment_variables import CONN_ENV_PREFIX
 from airflow.utils.session import NEW_SESSION, provide_session
 
 from tests_common.test_utils.api_fastapi import _check_last_log
 from tests_common.test_utils.asserts import assert_queries_count
+from tests_common.test_utils.config import conf_vars
 from tests_common.test_utils.db import clear_db_connections, clear_db_logs, clear_test_connections
 from tests_common.test_utils.markers import skip_if_force_lowest_dependencies_marker
 
@@ -164,6 +169,19 @@ class TestGetConnection(TestConnectionEndpoint):
         assert body["conn_type"] == TEST_CONN_TYPE
         assert body["extra"] == '{"extra_key": "extra_value"}'
 
+    @pytest.mark.parametrize("extra_value", [None, ""])
+    def test_get_should_respond_200_with_empty_extra(self, test_client, session, extra_value):
+        """Empty string or NULL extra should not break serialization (regression test for #64950)."""
+        self.create_connection()
+        connection = session.scalars(select(Connection)).first()
+        connection.extra = extra_value
+        session.commit()
+        response = test_client.get(f"/connections/{TEST_CONN_ID}")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["connection_id"] == TEST_CONN_ID
+        assert body["extra"] == extra_value
+
     @pytest.mark.enable_redact
     def test_get_should_respond_200_with_extra_redacted(self, test_client, session):
         self.create_connection()
@@ -216,6 +234,7 @@ class TestGetConnections(TestConnectionEndpoint):
             ({"order_by": "-id"}, 2, [TEST_CONN_ID_2, TEST_CONN_ID]),
             # Search
             ({"connection_id_pattern": "n_id_2"}, 1, [TEST_CONN_ID_2]),
+            ({"connection_id_prefix_pattern": "test_connection_id_2"}, 1, [TEST_CONN_ID_2]),
         ],
     )
     def test_should_respond_200(
@@ -282,10 +301,15 @@ class TestPostConnection(TestConnectionEndpoint):
         assert len(connection) == 1
         _check_last_log(session, dag_id=None, event="post_connection", logical_date=None)
 
+    @conf_vars({("core", "multi_team"): "True"})
     def test_post_should_respond_201_with_team(self, test_client, session, testing_team):
         response = test_client.post(
             "/connections",
-            json={"connection_id": TEST_CONN_ID, "conn_type": TEST_CONN_TYPE, "team_name": testing_team.name},
+            json={
+                "connection_id": TEST_CONN_ID,
+                "conn_type": TEST_CONN_TYPE,
+                "team_name": testing_team.name,
+            },
         )
         assert response.status_code == 201
         assert response.json() == {
@@ -333,6 +357,22 @@ class TestPostConnection(TestConnectionEndpoint):
                 }
             ]
         }
+
+    @conf_vars({("core", "multi_team"): "False"})
+    def test_post_rejects_team_name_when_multi_team_disabled(self, test_client):
+        response = test_client.post(
+            "/connections",
+            json={
+                "connection_id": TEST_CONN_ID_2,
+                "conn_type": TEST_CONN_TYPE_2,
+                "team_name": "test_team",
+            },
+        )
+        assert response.status_code == 422
+        assert (
+            "team_name cannot be set when multi_team mode is disabled. Please contact your administrator."
+            in response.json()["detail"][0]["msg"]
+        )
 
     @pytest.mark.parametrize(
         "body",
@@ -598,6 +638,7 @@ class TestPatchConnection(TestConnectionEndpoint):
 
         assert response.json() == expected_result
 
+    @conf_vars({("core", "multi_team"): "True"})
     def test_patch_with_team_should_respond_200(self, test_client, testing_team, session):
         self.create_connection()
 
@@ -934,6 +975,51 @@ class TestPatchConnection(TestConnectionEndpoint):
         assert response.json() == expected_response
         _check_last_log(session, dag_id=None, event="patch_connection", logical_date=None, check_masked=True)
 
+    def test_patch_with_update_mask_validates_extra_as_json(self, test_client):
+        """When update_mask includes 'extra', the extra field validator should still reject invalid JSON."""
+        self.create_connection()
+        response = test_client.patch(
+            f"/connections/{TEST_CONN_ID}",
+            json={
+                "connection_id": TEST_CONN_ID,
+                "conn_type": TEST_CONN_TYPE,
+                "extra": "not valid json",
+            },
+            params={"update_mask": ["extra"]},
+        )
+        assert response.status_code == 422
+
+    def test_patch_with_update_mask_rejects_extra_fields(self, test_client):
+        """Partial model should still forbid unknown fields."""
+        self.create_connection()
+        response = test_client.patch(
+            f"/connections/{TEST_CONN_ID}",
+            json={
+                "connection_id": TEST_CONN_ID,
+                "conn_type": TEST_CONN_TYPE,
+                "unknown_field": "value",
+            },
+            params={"update_mask": ["host"]},
+        )
+        assert response.status_code == 422
+
+    @conf_vars({("core", "multi_team"): "False"})
+    def test_patch_rejects_team_name_when_multi_team_disabled(self, test_client):
+        self.create_connection()
+        response = test_client.patch(
+            f"/connections/{TEST_CONN_ID_2}",
+            json={
+                "connection_id": TEST_CONN_ID_2,
+                "conn_type": "new_type",
+                "team_name": "test_team",
+            },
+        )
+        assert response.status_code == 422
+        assert (
+            "team_name cannot be set when multi_team mode is disabled. Please contact your administrator."
+            in response.json()["detail"][0]["msg"]
+        )
+
 
 class TestConnection(TestConnectionEndpoint):
     def setup_method(self):
@@ -1000,6 +1086,140 @@ class TestConnection(TestConnectionEndpoint):
             "detail": "Testing connections is disabled in Airflow configuration. "
             "Contact your deployment admin to enable it."
         }
+
+    @mock.patch.dict(os.environ, {"AIRFLOW__CORE__TEST_CONNECTION": "Enabled"})
+    def test_should_merge_password_with_existing_connection(self, test_client, session):
+        connection = Connection(
+            conn_id=TEST_CONN_ID,
+            conn_type="sqlite",
+            password="existing_password",
+        )
+        session.add(connection)
+        session.commit()
+        initial_count = session.scalar(select(func.count()).select_from(Connection))
+
+        captured_value = {}
+
+        def mock_test_connection(self):
+            captured_value["password"] = self.password
+            captured_value["conn_type"] = self.conn_type
+            return True, "mocked"
+
+        body = {
+            "connection_id": TEST_CONN_ID,
+            "conn_type": "new_sqlite",
+            "password": "***",
+        }
+
+        with mock.patch.object(Connection, "test_connection", mock_test_connection):
+            response = test_client.post("/connections/test", json=body)
+
+        assert response.status_code == 200
+        assert response.json()["status"] is True
+        # Verify that the existing password was used, not "***"
+        assert captured_value["password"] == "existing_password"
+        # Verify that payload info were used for other fields
+        assert captured_value["conn_type"] == "new_sqlite"
+
+        # Verify DB was not mutated
+        session.expire_all()
+        db_conn = session.scalar(select(Connection).filter_by(conn_id=TEST_CONN_ID))
+        assert db_conn.password == "existing_password"
+        assert session.scalar(select(func.count()).select_from(Connection)) == initial_count
+
+    @mock.patch.dict(os.environ, {"AIRFLOW__CORE__TEST_CONNECTION": "Enabled"})
+    def test_should_merge_extra_with_existing_connection(self, test_client, session):
+        connection = Connection(
+            conn_id=TEST_CONN_ID,
+            conn_type="fs",
+            extra='{"path": "/", "existing_key": "existing_value"}',
+        )
+        session.add(connection)
+        session.commit()
+        initial_count = session.scalar(select(func.count()).select_from(Connection))
+
+        captured_extra = {}
+
+        def mock_test_connection(self):
+            captured_extra["value"] = self.extra
+            return True, "mocked"
+
+        body = {
+            "connection_id": TEST_CONN_ID,
+            "conn_type": "fs",
+            "extra": '{"path": "/", "new_key": "new_value"}',
+        }
+
+        with mock.patch.object(Connection, "test_connection", mock_test_connection):
+            response = test_client.post("/connections/test", json=body)
+
+        assert response.status_code == 200
+        assert response.json()["status"] is True
+        # Verify that new_key is reflected in the merged extra
+        merged_extra = json.loads(captured_extra["value"])
+        assert merged_extra["new_key"] == "new_value"
+        assert merged_extra["path"] == "/"
+
+        # Verify DB was not mutated
+        session.expire_all()
+        db_conn = session.scalar(select(Connection).filter_by(conn_id=TEST_CONN_ID))
+        assert json.loads(db_conn.extra) == {"path": "/", "existing_key": "existing_value"}
+        assert session.scalar(select(func.count()).select_from(Connection)) == initial_count
+
+    @mock.patch.dict(os.environ, {"AIRFLOW__CORE__TEST_CONNECTION": "Enabled"})
+    def test_should_merge_both_password_and_extra(self, test_client, session):
+        connection = Connection(
+            conn_id=TEST_CONN_ID,
+            conn_type="fs",
+            password="existing_password",
+            extra='{"path": "/", "existing_key": "existing_value"}',
+        )
+        session.add(connection)
+        session.commit()
+        initial_count = session.scalar(select(func.count()).select_from(Connection))
+
+        captured_values = {}
+
+        def mock_test_connection(self):
+            captured_values["password"] = self.password
+            captured_values["extra"] = self.extra
+            return True, "mocked"
+
+        body = {
+            "connection_id": TEST_CONN_ID,
+            "conn_type": "fs",
+            "password": "***",
+            "extra": '{"path": "/", "new_key": "new_value"}',
+        }
+
+        with mock.patch.object(Connection, "test_connection", mock_test_connection):
+            response = test_client.post("/connections/test", json=body)
+
+        assert response.status_code == 200
+        assert response.json()["status"] is True
+        # Verify that the existing password was used, not "***"
+        assert captured_values["password"] == "existing_password"
+        # Verify that new_key is reflected in the merged extra
+        merged_extra = json.loads(captured_values["extra"])
+        assert merged_extra["new_key"] == "new_value"
+        assert merged_extra["path"] == "/"
+
+        # Verify DB was not mutated
+        session.expire_all()
+        db_conn = session.scalar(select(Connection).filter_by(conn_id=TEST_CONN_ID))
+        assert db_conn.password == "existing_password"
+        assert json.loads(db_conn.extra) == {"path": "/", "existing_key": "existing_value"}
+        assert session.scalar(select(func.count()).select_from(Connection)) == initial_count
+
+    @mock.patch.dict(os.environ, {"AIRFLOW__CORE__TEST_CONNECTION": "Enabled"})
+    def test_should_test_new_connection_without_existing(self, test_client):
+        body = {
+            "connection_id": "non_existent_conn",
+            "conn_type": "sqlite",
+        }
+        response = test_client.post("/connections/test", json=body)
+        assert response.status_code == 200
+        assert response.json()["status"] is True
 
 
 class TestCreateDefaultConnections(TestConnectionEndpoint):
@@ -1391,6 +1611,115 @@ class TestBulkConnections(TestConnectionEndpoint):
             },
         )
         assert response.status_code == 403
+
+    def test_bulk_update_avoids_n_plus_one_queries(self, session):
+        self.create_connections()
+        session.expire_all()
+
+        request = BulkBody[ConnectionBody].model_validate(
+            {
+                "actions": [
+                    {
+                        "action": "update",
+                        "entities": [
+                            {
+                                "connection_id": TEST_CONN_ID,
+                                "conn_type": TEST_CONN_TYPE,
+                                "description": "updated_description",
+                            },
+                            {
+                                "connection_id": TEST_CONN_ID_2,
+                                "conn_type": TEST_CONN_TYPE_2,
+                                "description": "updated_description_2",
+                            },
+                        ],
+                        "update_mask": ["description"],
+                        "action_on_non_existence": "fail",
+                    }
+                ]
+            }
+        )
+        service = BulkConnectionService(session=session, request=request)
+        results = BulkActionResponse()
+
+        with assert_queries_count(1, session=session):
+            service.handle_bulk_update(request.actions[0], results)
+
+        assert sorted(results.success) == [TEST_CONN_ID, TEST_CONN_ID_2]
+
+    def test_bulk_delete_avoids_n_plus_one_queries(self, session):
+        self.create_connections()
+        session.expire_all()
+
+        request = BulkBody[ConnectionBody].model_validate(
+            {
+                "actions": [
+                    {
+                        "action": "delete",
+                        "entities": [TEST_CONN_ID, TEST_CONN_ID_2],
+                        "action_on_non_existence": "fail",
+                    }
+                ]
+            }
+        )
+        service = BulkConnectionService(session=session, request=request)
+        results = BulkActionResponse()
+
+        with assert_queries_count(1, session=session):
+            service.handle_bulk_delete(request.actions[0], results)
+
+        assert sorted(results.success) == [TEST_CONN_ID, TEST_CONN_ID_2]
+
+    @conf_vars({("core", "multi_team"): "False"})
+    def test_bulk_rejects_team_name_when_multi_team_is_disabled(self, test_client):
+        actions = {
+            "actions": [
+                {
+                    "action": "create",
+                    "entities": [
+                        {
+                            "connection_id": "test_conn_id_1",
+                            "conn_type": TEST_CONN_TYPE,
+                            "description": "description",
+                        },
+                        {
+                            "connection_id": "test_conn_id_2",
+                            "conn_type": TEST_CONN_TYPE_2,
+                            "description": "description_2",
+                            "team_name": "test_team",
+                        },
+                    ],
+                },
+                {
+                    "action": "update",
+                    "entities": [
+                        {
+                            "connection_id": "test_conn_id_3",
+                            "conn_type": TEST_CONN_TYPE,
+                            "description": "updated_description",
+                            "team_name": "test_team",
+                        },
+                        {
+                            "connection_id": "test_conn_id_4",
+                            "conn_type": TEST_CONN_TYPE_2,
+                            "description": "updated_description_2",
+                        },
+                    ],
+                },
+            ]
+        }
+        response = test_client.patch("/connections", json=actions)
+        assert response.status_code == 422
+        detail = response.json()["detail"]
+
+        assert all(
+            "team_name cannot be set when multi_team mode is disabled. Please contact your administrator."
+            in err["msg"]
+            for err in detail
+        ), f"Unexpected errors in detail: {detail}"
+
+        expected_error_conn_ids = {err["input"]["connection_id"] for err in detail}
+        assert sorted(expected_error_conn_ids) == ["test_conn_id_2", "test_conn_id_3"]
 
 
 class TestPostConnectionExtraBackwardCompatibility(TestConnectionEndpoint):

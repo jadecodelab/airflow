@@ -47,7 +47,7 @@ export const LimitedItemsList = ({
   }
 
   return (
-    <HStack align="center" gap={1}>
+    <HStack align="center" data-testid="limited-items-list" gap={1}>
       {icon}
       <Box fontSize="sm">
         {displayItems.map((item, index) => (
@@ -67,8 +67,7 @@ export const LimitedItemsList = ({
             <Popover.Root lazyMount unmountOnExit>
               <Popover.Trigger asChild>
                 <Button
-                  colorPalette="brand"
-                  cursor="pointer"
+                  data-testid="limited-items-expand-button"
                   fontSize="sm"
                   minH="auto"
                   px={1}

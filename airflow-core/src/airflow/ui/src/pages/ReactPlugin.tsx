@@ -35,7 +35,7 @@ type PluginComponentType = FC<PluginProps>;
 
 const loadPlugin = (reactApp: ReactAppResponse): Promise<{ default: PluginComponentType }> =>
   // We are assuming the plugin manager is trusted and the bundle_url is safe
-  import(/* @vite-ignore */ reactApp.bundle_url)
+  import(/* @vite-ignore */ new URL(reactApp.bundle_url, document.baseURI).href)
     .then(() => {
       // Store components in globalThis[reactApp.name] to avoid conflicts with the shared globalThis.AirflowPlugin
       // global variable.
@@ -59,19 +59,29 @@ const loadPlugin = (reactApp: ReactAppResponse): Promise<{ default: PluginCompon
       // eslint-disable-next-line no-console
       console.error("Component failed to load:", error);
 
-      return {
-        default: ErrorPage,
-      };
+      return { default: ErrorPage };
     });
 
 export const ReactPlugin = ({ reactApp }: { readonly reactApp: ReactAppResponse }) => {
   const { dagId, mapIndex, runId, taskId } = useParams();
 
-  const Plugin = lazy(() => loadPlugin(reactApp));
+  // If the plugin component was already registered on the global object by a previous load,
+  // render it directly without going through Suspense/lazy (avoids flashing the spinner).
+  const existing = (globalThis as Record<string, unknown>)[reactApp.name];
+
+  if (typeof existing === "function") {
+    const Plugin = existing as PluginComponentType;
+
+    return <Plugin dagId={dagId} mapIndex={mapIndex} runId={runId} taskId={taskId} />;
+  }
+
+  // Otherwise, lazy-load the bundle once. When it resolves, it must set a function component
+  // under globalThis[reactApp.name], which we then use as the default export.
+  const LazyPlugin = lazy(() => loadPlugin(reactApp));
 
   return (
     <Suspense fallback={<Spinner />}>
-      <Plugin dagId={dagId} mapIndex={mapIndex} runId={runId} taskId={taskId} />
+      <LazyPlugin dagId={dagId} mapIndex={mapIndex} runId={runId} taskId={taskId} />
     </Suspense>
   );
 };

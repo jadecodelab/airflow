@@ -137,10 +137,10 @@ with DAG(
         # You can also label the selected values via values_display attribute
         "pick_with_label": Param(
             3,
-            type="number",
+            type=["number", "null"],
             title="Select one Number",
             description="With drop down selections you can also have nice display labels for the values.",
-            enum=[*range(1, 10)],
+            enum=[*range(1, 10), None],
             values_display={
                 1: "One",
                 2: "Two",
@@ -151,6 +151,7 @@ with DAG(
                 7: "Seven",
                 8: "Eight",
                 9: "Nine",
+                None: "None (clear selection)",
             },
             section="Drop-Downs and selection lists",
         ),
@@ -233,6 +234,46 @@ with DAG(
                 "required": ["name"],
             },
             section="Special advanced stuff with form fields",
+        ),
+        # Multi-type parameters
+        "batch_size": Param(
+            1000,
+            type=["integer", "string"],
+            title="Batch size (int or 'all')",
+            description_md=(
+                "Number of rows per batch as an integer, **or** the string ``all`` to process "
+                "everything in one pass. Try `500` → integer, `all` → string."
+            ),
+            section="Multi-type parameters",
+        ),
+        "notify": Param(
+            True,
+            type=["boolean", "string"],
+            title="Notification target",
+            description=(
+                "Set true/false to toggle the default recipient, or enter an email address "
+                "(string) to override it."
+            ),
+            section="Multi-type parameters",
+        ),
+        "pipeline_config": Param(
+            "nightly-export",
+            type=["string", "object"],
+            title="Pipeline (name or full config)",
+            description_md=(
+                "Pipeline shorthand name, or a JSON object with the full config, e.g. "
+                '`{"name": "nightly", "retries": 2}`'
+            ),
+            section="Multi-type parameters",
+        ),
+        "priority": Param(
+            5,
+            type=["integer", "string"],
+            title="Priority (number or label)",
+            description=(
+                "Numeric priority as an integer, or one of the named levels: 'low', 'normal', 'high'."
+            ),
+            section="Multi-type parameters",
         ),
         # If you want to have static parameters which are always passed and not editable by the user
         # then you can use the JSON schema option of passing constant values. These parameters

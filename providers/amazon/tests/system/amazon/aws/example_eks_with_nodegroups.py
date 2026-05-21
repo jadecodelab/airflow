@@ -135,8 +135,8 @@ with DAG(
 
     # [START howto_operator_eks_pod_operator]
     start_pod = EksPodOperator(
-        task_id="start_pod",
-        pod_name="test_pod",
+        task_id="run_pod",
+        pod_name="run_pod",
         cluster_name=cluster_name,
         image="amazon/aws-cli:latest",
         cmds=["sh", "-c", "echo Test Airflow; date"],
@@ -241,5 +241,5 @@ with DAG(
 
 from tests_common.test_utils.system_tests import get_test_run  # noqa: E402
 
-# Needed to run the example DAG with pytest (see: tests/system/README.md#run_via_pytest)
+# Needed to run the example DAG with pytest (see: contributing-docs/testing/system_tests.rst)
 test_run = get_test_run(dag)

@@ -27,6 +27,61 @@
 Changelog
 ---------
 
+5.12.0
+......
+
+Features
+~~~~~~~~
+
+* ``Add uri sanitizers and asset factories for new schemes (#66426)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Add explicit [tool.flit.sdist] sections to flit-based pyproject.tomls (#65861)``
+   * ``Fix stale system test documentation links (#65071)``
+
+5.11.2
+......
+
+Misc
+~~~~
+
+* ``Load hook metadata from YAML without importing Hook class (#63826)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+
+5.11.1
+......
+
+Misc
+~~~~
+
+* ``Add Python 3.14 Support (#63520)``
+
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Add *.iml to .gitignore in all distributions (#63636)``
+   * ``Standardize connection docs labels across providers (#63455)``
+
+5.11.0
+......
+
+Features
+~~~~~~~~
+
+* ``feat: Add Hook Level Lineage to SQL hooks (#61535)``
+
+Misc
+~~~~
+
+* ``Bump min sqlalchemy version to 1.4.54 (#62299)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Add 'lifecycle' field to provider.yaml schema and all providers per AIP-95 (#62190)``
+
 5.10.3
 ......
 

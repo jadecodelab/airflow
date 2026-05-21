@@ -153,10 +153,8 @@ class TestDockerOperator:
         self.client_mock.attach.return_value = self.log_messages
 
         # If logs() is called with tail then only return the last value, otherwise return the whole log.
-        self.client_mock.logs.side_effect = (
-            lambda **kwargs: iter(self.log_messages[-kwargs["tail"] :])
-            if "tail" in kwargs
-            else iter(self.log_messages)
+        self.client_mock.logs.side_effect = lambda **kwargs: (
+            iter(self.log_messages[-kwargs["tail"] :]) if "tail" in kwargs else iter(self.log_messages)
         )
 
         docker_api_client_patcher.return_value = self.client_mock
@@ -626,10 +624,8 @@ class TestDockerOperator:
         self.client_mock.pull.return_value = [b'{"status":"pull log"}']
         self.client_mock.attach.return_value = iter([b"container log 1 \n", b"container log 2\n"])
         # Make sure the logs side effect is updated after the change
-        self.client_mock.attach.side_effect = (
-            lambda **kwargs: iter(self.log_messages[-kwargs["tail"] :])
-            if "tail" in kwargs
-            else iter(self.log_messages)
+        self.client_mock.attach.side_effect = lambda **kwargs: (
+            iter(self.log_messages[-kwargs["tail"] :]) if "tail" in kwargs else iter(self.log_messages)
         )
 
         kwargs = {
@@ -821,4 +817,34 @@ class TestDockerOperator:
         )
         rendered = ti.render_templates()
         assert rendered.container_name == f"python_{ti.dag_id}"
+        assert rendered.mounts[0]["Target"] == f"/{ti.run_id}"
+
+    def test_dict_mounts_are_normalized_to_mount_objects(self):
+        op = DockerOperator(
+            task_id="test",
+            image="test",
+            mounts=[
+                {"target": "/data", "source": "workspace", "type": "volume", "read_only": False},
+                Mount(target="/logs", source="logs", type="volume"),
+            ],
+        )
+        assert all(isinstance(m, Mount) for m in op.mounts)
+        assert op.mounts[0]["Target"] == "/data"
+        assert op.mounts[0]["Source"] == "workspace"
+        assert op.mounts[0]["Type"] == "volume"
+        assert op.mounts[0]["ReadOnly"] is False
+        assert op.mounts[1]["Target"] == "/logs"
+
+    @pytest.mark.db_test
+    def test_dict_mounts_are_templated(self, create_task_instance_of_operator):
+        ti = create_task_instance_of_operator(
+            operator_class=DockerOperator,
+            dag_id="test",
+            task_id="test",
+            image="test",
+            mounts=[
+                {"target": "/{{task_instance.run_id}}", "source": "workspace", "type": "volume"},
+            ],
+        )
+        rendered = ti.render_templates()
         assert rendered.mounts[0]["Target"] == f"/{ti.run_id}"

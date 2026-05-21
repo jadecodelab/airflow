@@ -23,12 +23,11 @@ import logging
 from functools import cache
 from typing import TYPE_CHECKING
 
-from airflow import settings
-from airflow.providers_manager import ProvidersManager
+from airflow import settings  # noqa: SDK002
 from airflow.sdk._shared.module_loading import import_string
-from airflow.sdk._shared.observability.metrics.stats import Stats
+from airflow.sdk._shared.observability.metrics import stats
 from airflow.sdk._shared.plugins_manager import (
-    AirflowPlugin,
+    AirflowPlugin as AirflowPlugin,
     _load_entrypoint_plugins,
     _load_plugins_from_plugin_directory,
     integrate_listener_plugins as _integrate_listener_plugins,
@@ -36,9 +35,11 @@ from airflow.sdk._shared.plugins_manager import (
     is_valid_plugin,
 )
 from airflow.sdk.configuration import conf
+from airflow.sdk.providers_manager_runtime import ProvidersManagerTaskRuntime
 
 if TYPE_CHECKING:
-    from airflow.listeners.listener import ListenerManager
+    from airflow.sdk._shared.listeners.listener import ListenerManager
+    from airflow.sdk.lineage import HookLineageReader
 
 log = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ log = logging.getLogger(__name__)
 def _load_providers_plugins() -> tuple[list[AirflowPlugin], dict[str, str]]:
     """Load plugins from providers."""
     log.debug("Loading plugins from providers")
-    providers_manager = ProvidersManager()
+    providers_manager = ProvidersManagerTaskRuntime()
     providers_manager.initialize_providers_plugins()
 
     plugins: list[AirflowPlugin] = []
@@ -96,7 +97,7 @@ def _get_plugins() -> tuple[list[AirflowPlugin], dict[str, str]]:
                 import_errors[name] = str(e)
         import_errors.update(errors)
 
-    with Stats.timer() as timer:
+    with stats.timer() as timer:
         load_examples = conf.getboolean("core", "LOAD_EXAMPLES")
         __register_plugins(
             *_load_plugins_from_plugin_directory(
@@ -110,7 +111,7 @@ def _get_plugins() -> tuple[list[AirflowPlugin], dict[str, str]]:
         if not settings.LAZY_LOAD_PROVIDERS:
             __register_plugins(*_load_providers_plugins())
 
-    log.debug("Loading %d plugin(s) took %.2f seconds", len(plugins), timer.duration)
+    log.debug("Loading %d plugin(s) took %.2f ms", len(plugins), timer.duration)
     return plugins, import_errors
 
 
@@ -131,3 +132,14 @@ def integrate_listener_plugins(listener_manager: ListenerManager) -> None:
     """Add listeners from plugins."""
     plugins, _ = _get_plugins()
     _integrate_listener_plugins(listener_manager, plugins=plugins)
+
+
+@cache
+def get_hook_lineage_readers_plugins() -> list[type[HookLineageReader]]:
+    """Collect and get hook lineage reader classes registered by plugins."""
+    log.debug("Initialize hook lineage readers plugins")
+    result: list[type[HookLineageReader]] = []
+
+    for plugin in _get_plugins()[0]:
+        result.extend(plugin.hook_lineage_readers)
+    return result

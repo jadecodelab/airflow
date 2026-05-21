@@ -26,7 +26,7 @@ from fastapi import Path
 from pydantic import BaseModel, Field
 
 from airflow.executors.workloads import ExecuteTask  # noqa: TCH001
-from airflow.models.taskinstancekey import TaskInstanceKey
+from airflow.providers.common.compat.sdk import TaskInstanceKey
 from airflow.providers.edge3.models.edge_worker import EdgeWorkerState  # noqa: TCH001
 
 
@@ -121,6 +121,20 @@ class WorkerQueuesBase(BaseModel):
             description="List of queues the worker is pulling jobs from. If not provided, worker pulls from all queues.",
         ),
     ]
+    team_name: Annotated[
+        str | None,
+        Field(
+            None,
+            description=(
+                "Team name for the experimental ``[core] multi_team`` feature. "
+                "This is a UI/REST API-level hint; the Execution API does not "
+                "currently enforce team-based access boundaries -- see "
+                "``airflow-core/docs/security/workload.rst`` (section: "
+                "'No team-level isolation in Execution API'). Workers without "
+                "team_name behave as default-team workers."
+            ),
+        ),
+    ] = None
 
 
 class WorkerQueuesBody(WorkerQueuesBase):
@@ -141,11 +155,12 @@ class WorkerStateBody(WorkerQueuesBase):
         ),
     ] = None
     sysinfo: Annotated[
-        dict[str, str | int],
+        dict[str, str | int | float | datetime],
         Field(
             description="System information of the worker.",
             examples=[
                 {
+                    "status": 20,
                     "concurrency": 4,
                     "free_concurrency": 3,
                     "airflow_version": "2.0.0",
@@ -184,6 +199,14 @@ class WorkerRegistrationReturn(BaseModel):
     """The return class for the worker registration."""
 
     last_update: Annotated[datetime, Field(description="Time of the last update of the worker.")]
+    versions_match: Annotated[
+        bool,
+        Field(
+            description="Whether the worker and the server have matching versions of Airflow and the Edge Provider. "
+            "If False, the worker version is not matching and might need to be upgraded. But version is still "
+            "compatible enough to work. If True, worker and server versions match.",
+        ),
+    ] = False  # If not explicitly given assume it is not compatible
 
 
 class WorkerSetStateReturn(BaseModel):
@@ -200,3 +223,18 @@ class WorkerSetStateReturn(BaseModel):
         str | None,
         Field(description="Comments about the maintenance state of the worker."),
     ] = None
+    concurrency: Annotated[
+        int | None,
+        Field(
+            description="Desired concurrency for the worker set by an administrator. "
+            "None means no remote override; the worker uses its startup value.",
+        ),
+    ] = None
+    versions_match: Annotated[
+        bool,
+        Field(
+            description="Whether the worker and the server have matching versions of Airflow and the Edge Provider. "
+            "If False, the worker version is not matching and might need to be upgraded. But version is still "
+            "compatible enough to work. If True, worker and server versions match.",
+        ),
+    ] = False  # If not explicitly given assume it is not compatible

@@ -28,7 +28,10 @@ export class BasePage {
 
   public constructor(page: Page) {
     this.page = page;
-    this.welcomeHeading = page.locator('h2.chakra-heading:has-text("Welcome")');
+    this.welcomeHeading = page.getByRole("heading", {
+      level: 2,
+      name: "Welcome",
+    });
   }
 
   public async isLoggedIn(): Promise<boolean> {
@@ -37,9 +40,7 @@ export class BasePage {
 
       return true;
     } catch {
-      const currentUrl = this.page.url();
-
-      return !currentUrl.includes("/login");
+      return !this.page.url().includes("/login");
     }
   }
 
@@ -52,8 +53,17 @@ export class BasePage {
   }
 
   public async navigateTo(path: string): Promise<void> {
-    await this.page.goto(path, {
-      waitUntil: "domcontentloaded",
+    await this.page.goto(path, { waitUntil: "domcontentloaded" });
+  }
+
+  // Ark UI sets `data-state="closed"` synchronously on the close flag flip,
+  // but unmount only fires after `animationend`/`transitionend` — which WebKit
+  // occasionally drops under CI load. Wait on the dialog state, not on DOM
+  // detachment, so the test does not depend on the animation event firing.
+  // Any dialog part still in `data-state="open"` means a modal is active.
+  public async waitForAllDialogsClosed(timeout = 15_000): Promise<void> {
+    await expect(this.page.locator('[data-scope="dialog"][data-state="open"]')).toHaveCount(0, {
+      timeout,
     });
   }
 }

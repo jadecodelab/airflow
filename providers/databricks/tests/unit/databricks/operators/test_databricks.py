@@ -21,7 +21,7 @@ import hashlib
 from datetime import datetime, timedelta
 from typing import Any
 from unittest import mock
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -1046,6 +1046,48 @@ class TestDatabricksSubmitRunOperator:
         assert op.execute_complete(context=None, event=event) is None
 
     @mock.patch("airflow.providers.databricks.operators.databricks.DatabricksHook")
+    @mock.patch(
+        "airflow.providers.databricks.operators.databricks._handle_deferrable_databricks_operator_execution"
+    )
+    def test_execute_complete_repair_includes_job_parameters(self, mock_handle_exec, mock_hook_class):
+        mock_hook_instance = mock_hook_class.return_value
+        mock_hook_instance.get_job_id.return_value = 42
+        mock_hook_instance.get_latest_repair_id.return_value = None
+        mock_hook_instance.repair_run.return_value = "new_repair_id"
+
+        operator = DatabricksRunNowOperator(
+            task_id="test_task",
+            job_id=42,
+            json={"job_parameters": {"key1": "value1"}},
+            repair_run=True,
+            databricks_conn_id="test_conn",
+        )
+
+        context = {}
+        event = {
+            "run_id": 12345,
+            "run_page_url": "https://databricks-instance/#job/42/run/12345",
+            "run_state": RunState(
+                life_cycle_state="TERMINATED", result_state="FAILED", state_message="Some error occurred"
+            ).to_json(),
+            "repair_run": True,
+            "errors": ["Error detail"],
+        }
+
+        operator.execute_complete(context=context, event=event)
+
+        assert mock_hook_instance.repair_run.called, "hook.repair_run should have been called"
+
+        call_args = mock_hook_instance.repair_run.call_args
+        repair_json_passed = call_args[0][0]
+
+        assert "job_parameters" in repair_json_passed
+        assert repair_json_passed["job_parameters"] == {"key1": "value1"}
+        assert repair_json_passed["run_id"] == 12345
+        assert repair_json_passed["rerun_all_failed_tasks"] is True
+        assert mock_handle_exec.called
+
+    @mock.patch("airflow.providers.databricks.operators.databricks.DatabricksHook")
     def test_execute_complete_failure(self, db_mock_class):
         """
         Test `execute_complete` function in case the Trigger has returned a failure completion event.
@@ -1083,7 +1125,7 @@ class TestDatabricksSubmitRunOperator:
     @mock.patch("airflow.providers.databricks.operators.databricks.DatabricksHook")
     @mock.patch("airflow.providers.databricks.operators.databricks.DatabricksSubmitRunOperator.defer")
     def test_databricks_submit_run_deferrable_operator_failed_before_defer(self, mock_defer, db_mock_class):
-        """Asserts that a task is not deferred when its failed"""
+        """Asserts that terminal failures before deferral fail the task immediately."""
         run = {
             "new_cluster": NEW_CLUSTER,
             "notebook_task": NOTEBOOK_TASK,
@@ -1092,7 +1134,8 @@ class TestDatabricksSubmitRunOperator:
         db_mock = db_mock_class.return_value
         db_mock.submit_run.return_value = RUN_ID
         db_mock.get_run = make_run_with_state_mock("TERMINATED", "FAILED")
-        op.execute(None)
+        with pytest.raises(AirflowException, match="Job run failed with terminal state"):
+            op.execute(None)
 
         expected = utils.normalise_json_content(
             {"new_cluster": NEW_CLUSTER, "notebook_task": NOTEBOOK_TASK, "run_name": TASK_ID}
@@ -1635,6 +1678,40 @@ class TestDatabricksRunNowOperator:
         db_mock.get_run.assert_not_called()
 
     @mock.patch("airflow.providers.databricks.operators.databricks.DatabricksHook")
+    def test_cancel_previous_runs_without_job_id_raises(self, db_mock_class):
+        run = {
+            "notebook_params": NOTEBOOK_PARAMS,
+            "notebook_task": NOTEBOOK_TASK,
+            "jar_params": JAR_PARAMS,
+        }
+
+        op = DatabricksRunNowOperator(
+            task_id=TASK_ID,
+            json=run,
+            cancel_previous_runs=True,
+        )
+
+        db_mock = db_mock_class.return_value
+
+        with pytest.raises(
+            ValueError,
+            match="cancel_previous_runs=True requires either job_id or job_name",
+        ):
+            op.execute(None)
+
+        assert db_mock_class.mock_calls == [
+            call(
+                DEFAULT_CONN_ID,
+                retry_limit=op.databricks_retry_limit,
+                retry_delay=op.databricks_retry_delay,
+                retry_args=None,
+                caller="DatabricksRunNowOperator",
+            )
+        ]
+        assert db_mock.cancel_all_runs.mock_calls == []
+        assert db_mock.run_now.mock_calls == []
+
+    @mock.patch("airflow.providers.databricks.operators.databricks.DatabricksHook")
     def test_execute_task_deferred(self, db_mock_class):
         """
         Test the execute function in case where the run is successful.
@@ -1857,14 +1934,15 @@ class TestDatabricksRunNowOperator:
     @mock.patch("airflow.providers.databricks.operators.databricks.DatabricksHook")
     @mock.patch("airflow.providers.databricks.operators.databricks.DatabricksSubmitRunOperator.defer")
     def test_databricks_run_now_deferrable_operator_failed_before_defer(self, mock_defer, db_mock_class):
-        """Asserts that a task is not deferred when its failed"""
+        """Asserts that terminal failures before deferral fail the task immediately."""
         run = {"notebook_params": NOTEBOOK_PARAMS, "notebook_task": NOTEBOOK_TASK, "jar_params": JAR_PARAMS}
         op = DatabricksRunNowOperator(deferrable=True, task_id=TASK_ID, job_id=JOB_ID, json=run)
         db_mock = db_mock_class.return_value
         db_mock.run_now.return_value = RUN_ID
         db_mock.get_run = make_run_with_state_mock("TERMINATED", "FAILED")
 
-        op.execute(None)
+        with pytest.raises(AirflowException, match="Job run failed with terminal state"):
+            op.execute(None)
         expected = utils.normalise_json_content(
             {
                 "notebook_params": NOTEBOOK_PARAMS,
@@ -2524,6 +2602,63 @@ class TestDatabricksNotebookOperator:
         }
 
         assert task_json == expected_json
+
+    @pytest.mark.parametrize(
+        ("trigger_rule", "expected_run_if"),
+        [
+            ("all_failed", "ALL_FAILED"),
+            ("all_done", "ALL_DONE"),
+            ("one_success", "AT_LEAST_ONE_SUCCESS"),
+            ("one_failed", "AT_LEAST_ONE_FAILED"),
+            ("none_failed", "NONE_FAILED"),
+            ("none_failed_min_one_success", "NONE_FAILED"),
+            ("always", "ALL_DONE"),
+        ],
+    )
+    def test_convert_to_databricks_workflow_task_with_trigger_rule(self, trigger_rule, expected_run_if):
+        """Test that trigger_rule is mapped to Databricks run_if in the workflow task JSON."""
+        dag = DAG(dag_id="example_dag", schedule=None, start_date=datetime.now())
+        operator = DatabricksNotebookOperator(
+            notebook_path="/path/to/notebook",
+            source="WORKSPACE",
+            task_id="test_task",
+            trigger_rule=trigger_rule,
+            dag=dag,
+        )
+
+        databricks_workflow_task_group = MagicMock()
+        databricks_workflow_task_group.notebook_packages = []
+        databricks_workflow_task_group.notebook_params = {}
+
+        operator.task_group = databricks_workflow_task_group
+        relevant_upstreams = []
+        task_dict = {}
+
+        task_json = operator._convert_to_databricks_workflow_task(relevant_upstreams, task_dict)
+
+        assert task_json["run_if"] == expected_run_if
+
+    def test_convert_to_databricks_workflow_task_default_trigger_rule_no_run_if(self):
+        """Test that the default trigger_rule (all_success) does not add run_if to the task JSON."""
+        dag = DAG(dag_id="example_dag", schedule=None, start_date=datetime.now())
+        operator = DatabricksNotebookOperator(
+            notebook_path="/path/to/notebook",
+            source="WORKSPACE",
+            task_id="test_task",
+            dag=dag,
+        )
+
+        databricks_workflow_task_group = MagicMock()
+        databricks_workflow_task_group.notebook_packages = []
+        databricks_workflow_task_group.notebook_params = {}
+
+        operator.task_group = databricks_workflow_task_group
+        relevant_upstreams = []
+        task_dict = {}
+
+        task_json = operator._convert_to_databricks_workflow_task(relevant_upstreams, task_dict)
+
+        assert "run_if" not in task_json
 
     def test_convert_to_databricks_workflow_task_no_task_group(self):
         """Test that an error is raised if the operator is not in a TaskGroup."""

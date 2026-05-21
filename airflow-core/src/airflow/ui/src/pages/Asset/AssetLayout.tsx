@@ -18,10 +18,10 @@
  */
 import { HStack, Box, Text, Code } from "@chakra-ui/react";
 import { useReactFlow } from "@xyflow/react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { PanelGroup, Panel, PanelResizeHandle } from "react-resizable-panels";
-import { useParams } from "react-router-dom";
-import { useSearchParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 
 import { useAssetServiceGetAsset, useAssetServiceGetAssetEvents } from "openapi/queries";
 import { AssetEvents } from "src/components/Assets/AssetEvents";
@@ -29,8 +29,10 @@ import { BreadcrumbStats } from "src/components/BreadcrumbStats";
 import { useTableURLState } from "src/components/DataTable/useTableUrlState";
 import { ProgressBar } from "src/components/ui";
 import { SearchParamsKeys } from "src/constants/searchParams";
+import { GroupsProvider } from "src/context/groups";
 
 import { AssetGraph } from "./AssetGraph";
+import { AssetPanelButtons } from "./AssetPanelButtons";
 import { CreateAssetEvent } from "./CreateAssetEvent";
 import { Header } from "./Header";
 
@@ -38,6 +40,7 @@ export const AssetLayout = () => {
   const { i18n, t: translate } = useTranslation(["assets", "common"]);
   const { assetId } = useParams();
   const direction = i18n.dir();
+  const [dependencyType, setDependencyType] = useState<"data" | "scheduling">("scheduling");
 
   const { setTableURLState, tableURLState } = useTableURLState();
   const { pagination, sorting } = tableURLState;
@@ -107,7 +110,10 @@ export const AssetLayout = () => {
         >
           <Panel defaultSize={70} minSize={6}>
             <Box height="100%" position="relative" pr={2}>
-              <AssetGraph asset={asset} />
+              <AssetPanelButtons dependencyType={dependencyType} setDependencyType={setDependencyType} />
+              <GroupsProvider dagId="~">
+                <AssetGraph asset={asset} dependencyType={dependencyType} />
+              </GroupsProvider>
             </Box>
           </Panel>
           <PanelResizeHandle

@@ -28,6 +28,57 @@ Changelog
 ---------
 
 
+4.5.6
+.....
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Fix DockerOperator init crash on dict mount entries (#66553)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Add explicit [tool.flit.sdist] sections to flit-based pyproject.tomls (#65861)``
+   * ``Fix stale system test documentation links (#65071)``
+
+4.5.5
+.....
+
+Misc
+~~~~
+
+* ``Load hook metadata from YAML without importing Hook class (#63826)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+
+4.5.4
+.....
+
+Misc
+~~~~
+
+* ``Add Python 3.14 Support (#63520)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Add *.iml to .gitignore in all distributions (#63636)``
+
+4.5.3
+.....
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Switch from surrogateescape to replace to handle utf-8 error (#62632)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Prepare documentation for next release of providers (2026-02-24) (#62495)``
+   * ``Add 'lifecycle' field to provider.yaml schema and all providers per AIP-95 (#62190)``
+   * ``[Part 2] Migrate connection UI metadata to YAML for more providers (#62109)``
+   * ``CI: Upgrade important CI environment (#61417)``
+
 4.5.2
 .....
 

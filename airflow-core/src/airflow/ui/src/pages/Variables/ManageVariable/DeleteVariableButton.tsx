@@ -20,8 +20,7 @@ import { Button, Code, Flex, Heading, Text, useDisclosure, VStack } from "@chakr
 import { useTranslation } from "react-i18next";
 import { FiTrash2 } from "react-icons/fi";
 
-import { Dialog } from "src/components/ui";
-import ActionButton from "src/components/ui/ActionButton";
+import { IconButton, Dialog } from "src/components/ui";
 import { useDeleteVariable } from "src/queries/useDeleteVariable";
 
 type Props = {
@@ -38,19 +37,16 @@ const DeleteVariableButton = ({ deleteKey: variableKey, disabled }: Props) => {
 
   return (
     <>
-      <ActionButton
-        actionName={translate("variables.delete.title")}
+      <IconButton
         colorPalette="danger"
         disabled={disabled}
-        icon={<FiTrash2 />}
-        onClick={() => {
-          onOpen();
-        }}
-        text={translate("variables.delete.title")}
-        withText={false}
-      />
+        label={translate("variables.delete.title")}
+        onClick={onOpen}
+      >
+        <FiTrash2 />
+      </IconButton>
 
-      <Dialog.Root onOpenChange={onClose} open={open} size="xl">
+      <Dialog.Root onOpenChange={onClose} open={open}>
         <Dialog.Content backdrop>
           <Dialog.Header>
             <VStack align="start" gap={4}>

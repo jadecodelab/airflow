@@ -59,9 +59,10 @@ export const TeamSelector = <T extends FieldValues = FieldValues>({ control }: P
               ) : undefined}
               <Select
                 {...Field}
+                data-testid="team-selector"
                 isClearable
                 isDisabled={isLoading}
-                onChange={(val) => onChange(val?.value)}
+                onChange={(val) => onChange(val?.value ?? null)}
                 options={options}
                 placeholder={translate("team.selector.placeHolder")}
                 value={options.find((option) => option.value === value)}

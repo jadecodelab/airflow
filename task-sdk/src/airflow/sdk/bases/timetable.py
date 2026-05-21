@@ -37,15 +37,23 @@ class BaseTimetable:
 
     active_runs_limit: int | None = None
     """
-    Maximum active runs that can be active at one time for a DAG.
+    Maximum active runs that can be active at one time for a Dag.
 
-    This is called during DAG initialization, and the return value is used as
-    the DAG's default ``max_active_runs`` if not set on the DAG explicitly. This
+    This is called during Dag initialization, and the return value is used as
+    the DAG's default ``max_active_runs`` if not set on the Dag explicitly. This
     should generally return *None* (no limit), but some timetables may limit
     parallelism, such as ``ContinuousTimetable``.
     """
 
     asset_condition: BaseAsset | None = None
+
+    partitioned_at_runtime: bool = False
+    """
+    Whether this timetable defers partition selection to task runtime.
+
+    *True* for :class:`~airflow.sdk.PartitionAtRuntime`; downstream code can
+    branch on this flag instead of using ``isinstance``.
+    """
 
     def validate(self) -> None:
         """

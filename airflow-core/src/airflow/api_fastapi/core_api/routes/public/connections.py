@@ -27,6 +27,7 @@ from sqlalchemy import select
 from airflow.api_fastapi.common.db.common import SessionDep, paginated_select
 from airflow.api_fastapi.common.parameters import (
     QueryConnectionIdPatternSearch,
+    QueryConnectionIdPrefixPatternSearch,
     QueryLimit,
     QueryOffset,
     SortParam,
@@ -38,6 +39,7 @@ from airflow.api_fastapi.core_api.datamodels.common import (
 )
 from airflow.api_fastapi.core_api.datamodels.connections import (
     ConnectionBody,
+    ConnectionBodyPartial,
     ConnectionCollectionResponse,
     ConnectionResponse,
     ConnectionTestResponse,
@@ -54,6 +56,7 @@ from airflow.api_fastapi.core_api.services.public.connections import (
 )
 from airflow.api_fastapi.logging.decorators import action_logging
 from airflow.configuration import conf
+from airflow.exceptions import AirflowNotFoundException
 from airflow.models import Connection
 from airflow.secrets.environment_variables import CONN_ENV_PREFIX
 from airflow.utils.db import create_default_connections as db_create_default_connections
@@ -115,7 +118,7 @@ def get_connections(
         SortParam,
         Depends(
             SortParam(
-                ["conn_id", "conn_type", "description", "host", "port", "id"],
+                ["conn_id", "conn_type", "description", "host", "port", "id", "team_name"],
                 Connection,
                 {"connection_id": "conn_id"},
             ).dynamic_depends()
@@ -124,11 +127,12 @@ def get_connections(
     readable_connections_filter: ReadableConnectionsFilterDep,
     session: SessionDep,
     connection_id_pattern: QueryConnectionIdPatternSearch,
+    connection_id_prefix_pattern: QueryConnectionIdPrefixPatternSearch,
 ) -> ConnectionCollectionResponse:
     """Get all connection entries."""
     connection_select, total_entries = paginated_select(
         statement=select(Connection),
-        filters=[connection_id_pattern, readable_connections_filter],
+        filters=[connection_id_pattern, connection_id_prefix_pattern, readable_connections_filter],
         order_by=order_by,
         offset=offset,
         limit=limit,
@@ -202,19 +206,24 @@ def patch_connection(
             status.HTTP_404_NOT_FOUND, f"The Connection with connection_id: `{connection_id}` was not found"
         )
 
-    try:
-        ConnectionBody(**patch_body.model_dump())
-    except ValidationError as e:
-        raise RequestValidationError(errors=e.errors())
+    if update_mask:
+        fields_to_update = patch_body.model_fields_set & set(update_mask)
+        try:
+            ConnectionBodyPartial(**patch_body.model_dump(include=fields_to_update))
+        except ValidationError as e:
+            raise RequestValidationError(errors=e.errors())
+    else:
+        try:
+            ConnectionBody(**patch_body.model_dump())
+        except ValidationError as e:
+            raise RequestValidationError(errors=e.errors())
 
     update_orm_from_pydantic(connection, patch_body, update_mask)
     return connection
 
 
 @connections_router.post("/test", dependencies=[Depends(requires_access_connection(method="POST"))])
-def test_connection(
-    test_body: ConnectionBody,
-) -> ConnectionTestResponse:
+def test_connection(test_body: ConnectionBody) -> ConnectionTestResponse:
     """
     Test an API connection.
 
@@ -232,9 +241,17 @@ def test_connection(
     transient_conn_id = get_random_string()
     conn_env_var = f"{CONN_ENV_PREFIX}{transient_conn_id.upper()}"
     try:
-        data = test_body.model_dump(by_alias=True)
-        data["conn_id"] = transient_conn_id
-        conn = Connection(**data)
+        # Try to get existing connection and merge with provided values
+        try:
+            existing_conn = Connection.get_connection_from_secrets(test_body.connection_id)
+            existing_conn.conn_id = transient_conn_id
+            update_orm_from_pydantic(existing_conn, test_body)
+            conn = existing_conn
+        except AirflowNotFoundException:
+            data = test_body.model_dump(by_alias=True)
+            data["conn_id"] = transient_conn_id
+            conn = Connection(**data)
+
         os.environ[conn_env_var] = conn.get_uri()
         test_status, test_message = conn.test_connection()
         return ConnectionTestResponse.model_validate({"status": test_status, "message": test_message})

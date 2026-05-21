@@ -23,15 +23,14 @@ import logging
 import zlib
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
+from uuid import UUID
 
-import sqlalchemy_jsonfield
 import uuid6
-from sqlalchemy import ForeignKey, LargeBinary, String, select, tuple_, update
+from sqlalchemy import JSON, ForeignKey, LargeBinary, String, Uuid, exists, select, tuple_, update
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, backref, foreign, joinedload, relationship
+from sqlalchemy.orm import Mapped, backref, foreign, mapped_column, relationship
 from sqlalchemy.sql.expression import func, literal
-from sqlalchemy_utils import UUIDType
 
 from airflow._shared.timezones import timezone
 from airflow.configuration import conf
@@ -44,13 +43,17 @@ from airflow.models.dag import DagModel
 from airflow.models.dag_version import DagVersion
 from airflow.models.dagcode import DagCode
 from airflow.models.dagrun import DagRun
+from airflow.models.deadline_alert import DeadlineAlert as DeadlineAlertModel
+from airflow.models.taskinstance import TaskInstance
 from airflow.serialization.dag_dependency import DagDependency
 from airflow.serialization.definitions.assets import SerializedAssetUniqueKey as UKey
+from airflow.serialization.definitions.deadline import DeadlineAlertFields
+from airflow.serialization.enums import Encoding
 from airflow.serialization.serialized_objects import DagSerialization
 from airflow.settings import json
 from airflow.utils.hashlib_wrapper import md5
 from airflow.utils.session import NEW_SESSION, provide_session
-from airflow.utils.sqlalchemy import UtcDateTime, get_dialect_name, mapped_column
+from airflow.utils.sqlalchemy import UtcDateTime, get_dialect_name
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -65,6 +68,14 @@ log = logging.getLogger(__name__)
 
 # If set to True, serialized DAGs is compressed before writing to DB,
 _COMPRESS_SERIALIZED_DAGS = conf.getboolean("core", "compress_serialized_dags", fallback=False)
+
+
+class DagWriteMetadata(NamedTuple):
+    """Pre-fetched metadata for write_dag to avoid per-DAG queries."""
+
+    last_updated: datetime | None
+    dag_hash: str | None
+    dag_version: DagVersion | None
 
 
 class _DagDependenciesResolver:
@@ -289,10 +300,10 @@ class SerializedDagModel(Base):
     """
 
     __tablename__ = "serialized_dag"
-    id: Mapped[str] = mapped_column(UUIDType(binary=False), primary_key=True, default=uuid6.uuid7)
+    id: Mapped[UUID] = mapped_column(Uuid(), primary_key=True, default=uuid6.uuid7)
     dag_id: Mapped[str] = mapped_column(String(ID_LEN), nullable=False)
     _data: Mapped[dict | None] = mapped_column(
-        "data", sqlalchemy_jsonfield.JSONField(json=json).with_variant(JSONB, "postgresql"), nullable=True
+        "data", JSON().with_variant(JSONB, "postgresql"), nullable=True
     )
     _data_compressed: Mapped[bytes | None] = mapped_column("data_compressed", LargeBinary, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=timezone.utcnow)
@@ -315,13 +326,20 @@ class SerializedDagModel(Base):
         innerjoin=True,
         backref=backref("serialized_dag", uselist=False, innerjoin=True),
     )
-    dag_version_id: Mapped[str] = mapped_column(
-        UUIDType(binary=False),
+    dag_version_id: Mapped[UUID] = mapped_column(
+        Uuid(),
         ForeignKey("dag_version.id", ondelete="CASCADE"),
         nullable=False,
         unique=True,
     )
     dag_version = relationship("DagVersion", back_populates="serialized_dag")
+
+    deadline_alerts = relationship(
+        "DeadlineAlert",
+        foreign_keys="DeadlineAlert.serialized_dag_id",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
     load_op_links = True
 
@@ -365,7 +383,7 @@ class SerializedDagModel(Base):
         """Recursively sort json_dict and its nested dictionaries and lists."""
         if isinstance(serialized_dag, dict):
             return {k: cls._sort_serialized_dag_dict(v) for k, v in sorted(serialized_dag.items())}
-        if isinstance(serialized_dag, list):
+        if isinstance(serialized_dag, (list, tuple)):
             if all(isinstance(i, dict) for i in serialized_dag):
                 if all(
                     isinstance(i.get("__var", {}), Iterable) and "task_id" in i.get("__var", {})
@@ -381,14 +399,208 @@ class SerializedDagModel(Base):
         return serialized_dag
 
     @classmethod
+    def _generate_deadline_uuids(cls, dag_data: dict[str, Any]) -> dict[str, dict]:
+        """
+        Generate UUIDs for DeadlineAlerts and replace dicts with list[UUID] in dag_data.
+
+        This modifies dag_data in place, replacing deadline alert definitions with UUID strings.
+        Called before SerializedDagModel creation to ensure UUIDs are included in the hash.
+
+        :param dag_data: The serialized DAG data dictionary
+        :return: Mapping of UUID strings to deadline alert data dicts
+        """
+        uuid_mapping: dict[str, dict] = {}
+
+        dag_deadline_data = dag_data.get("dag", {}).get("deadline")
+        if not dag_deadline_data:
+            return uuid_mapping
+
+        for deadline_alert in dag_deadline_data:
+            deadline_data = deadline_alert.get(Encoding.VAR, deadline_alert)
+
+            deadline_uuid = str(uuid6.uuid7())
+            uuid_mapping[deadline_uuid] = deadline_data
+
+        dag_data["dag"]["deadline"] = list(uuid_mapping.keys())
+
+        return uuid_mapping
+
+    @classmethod
+    def _try_reuse_deadline_uuids(
+        cls,
+        existing_deadline_uuids: list[str],
+        new_deadline_data: list[dict],
+        session: Session,
+    ) -> tuple[dict[str, dict], dict[str, str | None]] | None:
+        """
+        Try to reuse existing deadline UUIDs if the deadline definitions haven't changed.
+
+        Returns None if Deadline hashes are not all identical, indicating they need to be updated.
+
+        :param existing_deadline_uuids: List of UUID strings from existing serialized Dag
+        :param new_deadline_data: List of new deadline alert data dicts from the Dag
+        :param session: Database session
+        :return: Tuple of (uuid_mapping, name_updates) if all definitions match, None if any
+            mismatch detected.  ``uuid_mapping`` maps UUID string → new deadline data dict.
+            ``name_updates`` maps UUID string → new name **only** for entries whose name
+            changed relative to the existing DB row, so callers can issue targeted UPDATEs
+            and reliably detect whether any DB write occurred.
+        """
+        # defensive check for old 3.1.x format
+        if existing_deadline_uuids and not isinstance(existing_deadline_uuids[0], str):
+            # this triggers _generate_deadline_uuids to create fresh UUIDs
+            return None
+
+        def _definitions_match(deadline_data: dict, existing: DeadlineAlertModel) -> bool:
+            """Check if raw deadline data matches an existing DeadlineAlert's definition."""
+            return (
+                deadline_data[DeadlineAlertFields.REFERENCE] == existing.reference
+                and deadline_data[DeadlineAlertFields.INTERVAL] == existing.interval
+                and deadline_data[DeadlineAlertFields.CALLBACK] == existing.callback_def
+            )
+
+        if len(existing_deadline_uuids) != len(new_deadline_data):
+            return None
+
+        existing_deadline_uuids_as_uuid = [UUID(uid) for uid in existing_deadline_uuids]
+        existing_alerts = session.scalars(
+            select(DeadlineAlertModel).where(DeadlineAlertModel.id.in_(existing_deadline_uuids_as_uuid))
+        ).all()
+
+        if len(existing_alerts) != len(existing_deadline_uuids):
+            return None
+
+        matched_uuids: set[UUID] = set()
+        uuid_mapping: dict[str, dict] = {}
+        name_updates: dict[str, str | None] = {}
+
+        for deadline_alert in new_deadline_data:
+            deadline_data = deadline_alert.get(Encoding.VAR, deadline_alert)
+
+            found_match = False
+            for existing_alert in existing_alerts:
+                if existing_alert.id in matched_uuids:
+                    continue  # Already matched to another new deadline
+
+                if _definitions_match(deadline_data, existing_alert):
+                    # Found a match, reuse this UUID
+                    uuid_str = str(existing_alert.id)
+                    uuid_mapping[uuid_str] = deadline_data
+                    matched_uuids.add(existing_alert.id)
+                    found_match = True
+                    new_name = deadline_data.get(DeadlineAlertFields.NAME)
+                    if new_name != existing_alert.name:
+                        name_updates[uuid_str] = new_name
+                    break
+
+            if not found_match:
+                # Any mismatch triggers full regeneration of all UUIDs. This is intentional:
+                # deadlines may be interdependent (e.g. a custom DeadlineReference relative
+                # to another deadline), so partial reuse would risk stale cross-references.
+                return None
+
+        return uuid_mapping, name_updates
+
+    @classmethod
+    def _create_deadline_alert_records(
+        cls,
+        serialized_dag: SerializedDagModel,
+        uuid_mapping: dict[str, dict],
+    ) -> None:
+        """
+        Create DeadlineAlert records in the database and appends them to serialized_dag.
+
+        :param serialized_dag: The SerializedDagModel instance (not yet flushed)
+        :param uuid_mapping: Mapping of UUID strings to deadline alert data dicts
+        """
+        if not uuid_mapping:
+            return
+
+        for uuid_str, deadline_data in uuid_mapping.items():
+            alert = DeadlineAlertModel(
+                id=UUID(uuid_str),
+                name=deadline_data.get(DeadlineAlertFields.NAME),
+                reference=deadline_data[DeadlineAlertFields.REFERENCE],
+                interval=deadline_data[DeadlineAlertFields.INTERVAL],
+                callback_def=deadline_data[DeadlineAlertFields.CALLBACK],
+            )
+            serialized_dag.deadline_alerts.append(alert)
+
+    @classmethod
+    def _prefetch_dag_write_metadata(
+        cls, dag_ids: Iterable[str], *, session: Session
+    ) -> dict[str, DagWriteMetadata]:
+        """
+        Bulk-fetch metadata needed by write_dag for multiple DAGs in two queries.
+
+        Instead of running 3 SELECTs per DAG in write_dag (update interval check,
+        hash comparison, version fetch), this fetches all needed data upfront.
+
+        :param dag_ids: DAG IDs to prefetch metadata for
+        :param session: ORM Session
+        :returns: dict mapping dag_id to DagWriteMetadata
+        """
+        dag_id_list = list(set(dag_ids))
+        if not dag_id_list:
+            return {}
+
+        # Fetch latest serialized_dag (last_updated, dag_hash) per dag_id
+        # using a window function to pick the most recent row.
+        sd_subq = (
+            select(
+                cls.dag_id.label("dag_id"),
+                cls.last_updated.label("last_updated"),
+                cls.dag_hash.label("dag_hash"),
+                func.row_number().over(partition_by=cls.dag_id, order_by=cls.created_at.desc()).label("rn"),
+            )
+            .where(cls.dag_id.in_(dag_id_list))
+            .subquery()
+        )
+        sd_rows = session.execute(
+            select(sd_subq.c.dag_id, sd_subq.c.last_updated, sd_subq.c.dag_hash).where(sd_subq.c.rn == 1)
+        ).all()
+        sd_by_dag_id: dict[str, tuple[datetime, str]] = {
+            row.dag_id: (row.last_updated, row.dag_hash) for row in sd_rows
+        }
+
+        # Fetch latest DagVersion per dag_id using a window function,
+        # matching the original write_dag ordering (ORDER BY created_at DESC).
+        dv_subq = (
+            select(
+                DagVersion.id.label("id"),
+                DagVersion.dag_id.label("dag_id"),
+                func.row_number()
+                .over(partition_by=DagVersion.dag_id, order_by=DagVersion.created_at.desc())
+                .label("rn"),
+            )
+            .where(DagVersion.dag_id.in_(dag_id_list))
+            .subquery()
+        )
+        dag_versions = session.scalars(
+            select(DagVersion).join(dv_subq, DagVersion.id == dv_subq.c.id).where(dv_subq.c.rn == 1)
+        ).all()
+        dv_by_dag_id: dict[str, DagVersion] = {dv.dag_id: dv for dv in dag_versions}
+
+        return {
+            dag_id: DagWriteMetadata(
+                last_updated=sd_by_dag_id[dag_id][0] if dag_id in sd_by_dag_id else None,
+                dag_hash=sd_by_dag_id[dag_id][1] if dag_id in sd_by_dag_id else None,
+                dag_version=dv_by_dag_id.get(dag_id),
+            )
+            for dag_id in dag_id_list
+        }
+
+    @classmethod
     @provide_session
     def write_dag(
         cls,
         dag: LazyDeserializedDAG,
         bundle_name: str,
         bundle_version: str | None = None,
+        version_data: dict | None = None,
         min_update_interval: int | None = None,
         session: Session = NEW_SESSION,
+        _prefetched: DagWriteMetadata | None = None,
     ) -> bool:
         """
         Serialize a DAG and writes it into database.
@@ -399,47 +611,103 @@ class SerializedDagModel(Base):
         :param dag: a DAG to be written into database
         :param bundle_name: bundle name of the DAG
         :param bundle_version: bundle version of the DAG
+        :param version_data: optional structured data associated with this version
         :param min_update_interval: minimal interval in seconds to update serialized DAG
         :param session: ORM Session
+        :param _prefetched: Pre-fetched metadata to skip per-DAG queries; used by bulk callers
 
         :returns: Boolean indicating if the DAG was written to the DB
         """
+        if _prefetched is None:
+            _prefetched = cls._prefetch_dag_write_metadata([dag.dag_id], session=session).get(
+                dag.dag_id, DagWriteMetadata(last_updated=None, dag_hash=None, dag_version=None)
+            )
+
         # Checks if (Current Time - Time when the DAG was written to DB) < min_update_interval
         # If Yes, does nothing
         # If No or the DAG does not exists, updates / writes Serialized DAG to DB
         if min_update_interval is not None:
-            if session.scalar(
-                select(literal(True))
-                .where(
-                    cls.dag_id == dag.dag_id,
-                    (timezone.utcnow() - timedelta(seconds=min_update_interval)) < cls.last_updated,
-                )
-                .select_from(cls)
+            if (
+                _prefetched.last_updated is not None
+                and (timezone.utcnow() - timedelta(seconds=min_update_interval)) < _prefetched.last_updated
             ):
                 return False
 
         log.debug("Checking if DAG (%s) changed", dag.dag_id)
+        serialized_dag_hash = _prefetched.dag_hash
+        dag_version = _prefetched.dag_version
+
+        name_updated = False
+        if dag.data.get("dag", {}).get("deadline"):
+            # Try to reuse existing deadline UUIDs if the deadline definitions haven't changed.
+            # This preserves the hash and avoids unnecessary SerializedDagModel recreations.
+            existing_serialized_dag = session.scalar(
+                select(cls).where(cls.dag_id == dag.dag_id).order_by(cls.created_at.desc()).limit(1)
+            )
+
+            if (
+                existing_serialized_dag
+                and existing_serialized_dag.data
+                and (existing_deadline_uuids := existing_serialized_dag.data.get("dag", {}).get("deadline"))
+            ):
+                reuse_result = cls._try_reuse_deadline_uuids(
+                    existing_deadline_uuids,
+                    dag.data["dag"]["deadline"],
+                    session,
+                )
+
+                if reuse_result is not None:
+                    deadline_uuid_mapping, name_updates = reuse_result
+                    # All deadlines matched — reuse the UUIDs to preserve hash.
+                    # Only issue UPDATE statements for rows whose name actually changed to
+                    # avoid unnecessary writes and to make the return value accurate.
+                    for uuid_str, new_name in name_updates.items():
+                        session.execute(
+                            update(DeadlineAlertModel)
+                            .where(DeadlineAlertModel.id == UUID(uuid_str))
+                            .values(name=new_name)
+                        )
+                    name_updated = bool(name_updates)
+                    dag.data["dag"]["deadline"] = existing_deadline_uuids
+                    deadline_uuid_mapping = {}
+                else:
+                    # At least one deadline has changed, generate new UUIDs and update the hash.
+                    deadline_uuid_mapping = cls._generate_deadline_uuids(dag.data)
+            else:
+                # First time seeing this Dag with deadlines, generate new UUIDs and update the hash.
+                deadline_uuid_mapping = cls._generate_deadline_uuids(dag.data)
+        else:
+            deadline_uuid_mapping = {}
+
         new_serialized_dag = cls(dag)
-        serialized_dag_hash = session.scalars(
-            select(cls.dag_hash).where(cls.dag_id == dag.dag_id).order_by(cls.created_at.desc())
-        ).first()
-        dag_version = session.scalar(
-            select(DagVersion)
-            .where(DagVersion.dag_id == dag.dag_id)
-            .options(joinedload(DagVersion.task_instances))
-            .order_by(DagVersion.created_at.desc())
-            .limit(1)
-        )
 
         if (
             serialized_dag_hash == new_serialized_dag.dag_hash
             and dag_version
             and dag_version.bundle_name == bundle_name
         ):
+            if name_updated:
+                # The serialized DAG itself is unchanged, but deadline alert name(s) were
+                # updated in the DB, so report True so callers know a write did occur.
+                return True
             log.debug("Serialized DAG (%s) is unchanged. Skipping writing to DB", dag.dag_id)
             return False
 
-        if dag_version and not dag_version.task_instances:
+        has_task_instances: bool = False
+        if dag_version:
+            has_task_instances = bool(
+                session.scalar(
+                    select(
+                        exists().where(
+                            # Using dag_id filter to speed up query via the composite index.
+                            TaskInstance.dag_id == dag.dag_id,
+                            TaskInstance.dag_version_id == dag_version.id,
+                        )
+                    )
+                )
+            )
+
+        if dag_version and not has_task_instances:
             # This is for dynamic DAGs that the hashes changes often. We should update
             # the serialized dag, the dag_version and the dag_code instead of a new version
             # if the dag_version is not associated with any task instances
@@ -460,11 +728,21 @@ class SerializedDagModel(Base):
             if getattr(result, "rowcount", 0) == 0:
                 # No rows updated - serialized DAG doesn't exist
                 return False
+
+            if deadline_uuid_mapping:
+                updated_serialized_dag = session.scalar(
+                    select(cls).where(cls.dag_version_id == dag_version.id)
+                )
+                if updated_serialized_dag:
+                    updated_serialized_dag.deadline_alerts.clear()
+                    cls._create_deadline_alert_records(updated_serialized_dag, deadline_uuid_mapping)
+
             # The dag_version and dag_code may not have changed, still we should
             # do the below actions:
             # Update the latest dag version
             dag_version.bundle_name = bundle_name
             dag_version.bundle_version = bundle_version
+            dag_version.version_data = version_data
             session.merge(dag_version)
             # Update the latest DagCode
             DagCode.update_source_code(dag_id=dag.dag_id, fileloc=dag.fileloc, session=session)
@@ -474,11 +752,13 @@ class SerializedDagModel(Base):
             dag_id=dag.dag_id,
             bundle_name=bundle_name,
             bundle_version=bundle_version,
+            version_data=version_data,
             session=session,
         )
         log.debug("Writing Serialized DAG: %s to the DB", dag.dag_id)
         new_serialized_dag.dag_version = dagv
         session.add(new_serialized_dag)
+        cls._create_deadline_alert_records(new_serialized_dag, deadline_uuid_mapping)
         log.debug("DAG: %s written to the DB", dag.dag_id)
         DagCode.write_code(dagv, dag.fileloc, session=session)
         return True

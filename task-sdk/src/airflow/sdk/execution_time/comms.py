@@ -48,7 +48,9 @@ Execution API server is because:
 
 from __future__ import annotations
 
+import asyncio
 import itertools
+import threading
 from collections.abc import Iterator
 from datetime import datetime
 from functools import cached_property
@@ -67,8 +69,10 @@ from airflow.sdk.api.datamodels._generated import (
     AssetEventResponse,
     AssetEventsResponse,
     AssetResponse,
+    AssetStateResponse,
     BundleInfo,
     ConnectionResponse,
+    DagResponse,
     DagRun,
     DagRunStateResponse,
     HITLDetailRequest,
@@ -78,6 +82,7 @@ from airflow.sdk.api.datamodels._generated import (
     TaskBreadcrumbsResponse,
     TaskInstance,
     TaskInstanceState,
+    TaskStateResponse,
     TaskStatesResponse,
     TIDeferredStatePayload,
     TIRescheduleStatePayload,
@@ -99,6 +104,10 @@ try:
 except ImportError:
     # Available on Unix and Windows (so "everywhere") but lets be safe
     recv_fds = None  # type: ignore[assignment]
+
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+_trace_propagator = TraceContextTextMapPropagator()
 
 
 if TYPE_CHECKING:
@@ -130,23 +139,14 @@ def _new_encoder() -> msgspec.msgpack.Encoder:
     return msgspec.msgpack.Encoder(enc_hook=_msgpack_enc_hook)
 
 
-class _RequestFrame(msgspec.Struct, array_like=True, frozen=True, omit_defaults=True):
-    id: int
-    """
-    The request id, set by the sender.
-
-    This is used to allow "pipeling" of requests and to be able to tie response to requests, which is
-    particularly useful in the Triggerer where multiple async tasks can send a requests concurrently.
-    """
-    body: dict[str, Any] | None
-
-    req_encoder: ClassVar[msgspec.msgpack.Encoder] = _new_encoder()
+class _FrameMixin:
+    _encoder: ClassVar[msgspec.msgpack.Encoder] = _new_encoder()
 
     def as_bytes(self) -> bytearray:
         # https://jcristharif.com/msgspec/perf-tips.html#length-prefix-framing for inspiration
         buffer = bytearray(256)
 
-        self.req_encoder.encode_into(self, buffer, 4)
+        self._encoder.encode_into(self, buffer, 4)  # type: ignore[arg-type]
 
         n = len(buffer) - 4
         if n >= 2**32:
@@ -156,7 +156,25 @@ class _RequestFrame(msgspec.Struct, array_like=True, frozen=True, omit_defaults=
         return buffer
 
 
-class _ResponseFrame(_RequestFrame, frozen=True):
+class _RequestFrame(_FrameMixin, msgspec.Struct, array_like=True, frozen=True, omit_defaults=True):  # type: ignore[call-arg]
+    id: int
+    """
+    The request id, set by the sender.
+
+    This is used to allow "pipeling" of requests and to be able to tie response to requests, which is
+    particularly useful in the Triggerer where multiple async tasks can send a requests concurrently.
+    """
+    body: dict[str, Any] | None
+    context_carrier: dict[str, str] | None = None
+    """W3C trace context carrier (traceparent + tracestate) of the task runner's active span.
+
+    The supervisor extracts this to restore the task runner's trace context before making outbound HTTP
+    calls, so that server-side spans (e.g. POST /xcoms/…) appear as children of the correct task span
+    rather than under the supervisor's own span.
+    """
+
+
+class _ResponseFrame(_FrameMixin, msgspec.Struct, array_like=True, frozen=True, omit_defaults=True):  # type: ignore[call-arg]
     id: int
     """
     The id of the request this is a response to
@@ -185,31 +203,72 @@ class CommsDecoder(Generic[ReceiveMsgType, SendMsgType]):
 
     err_decoder: TypeAdapter[ErrorResponse] = attrs.field(factory=lambda: TypeAdapter(ToTask), repr=False)
 
+    # Threading lock for sync operations
+    _thread_lock: threading.Lock = attrs.field(factory=threading.Lock, repr=False)
+    # Async lock for async operations
+    _async_lock: asyncio.Lock = attrs.field(factory=asyncio.Lock, repr=False)
+
+    def _make_frame(self, msg: SendMsgType) -> _RequestFrame:
+        carrier: dict[str, str] = {}
+        _trace_propagator.inject(carrier)
+        return _RequestFrame(id=next(self.id_counter), body=msg.model_dump(), context_carrier=carrier or None)
+
     def send(self, msg: SendMsgType) -> ReceiveMsgType | None:
         """Send a request to the parent and block until the response is received."""
-        frame = _RequestFrame(id=next(self.id_counter), body=msg.model_dump())
-        frame_bytes = frame.as_bytes()
+        frame_bytes = self._make_frame(msg).as_bytes()
 
-        self.socket.sendall(frame_bytes)
-        if isinstance(msg, ResendLoggingFD):
-            if recv_fds is None:
-                return None
-            # We need special handling here! The server can't send us the fd number, as the number on the
-            # supervisor will be different to in this process, so we have to mutate the message ourselves here.
-            frame, fds = self._read_frame(maxfds=1)
-            resp = self._from_frame(frame)
-            if TYPE_CHECKING:
-                assert isinstance(resp, SentFDs)
-            resp.fds = fds
-            # Since we know this is an expliclt SendFDs, and since this class is generic SendFDs might not
-            # always be in the return type union
-            return resp  # type: ignore[return-value]
+        # We must make sure sockets aren't intermixed between sync and async calls,
+        # thus we need a dual locking mechanism to ensure that.
+        with self._thread_lock:
+            self.socket.sendall(frame_bytes)
+            if isinstance(msg, ResendLoggingFD):
+                if recv_fds is None:
+                    return None
+                # We need special handling here! The server can't send us the fd number, as the number on the
+                # supervisor will be different to in this process, so we have to mutate the message ourselves here.
+                frame, fds = self._read_frame(maxfds=1)
+                resp = self._from_frame(frame)
+                if TYPE_CHECKING:
+                    assert isinstance(resp, SentFDs)
+                resp.fds = fds
+                # Since we know this is an expliclt SendFDs, and since this class is generic SendFDs might not
+                # always be in the return type union
+                return resp  # type: ignore[return-value]
 
-        return self._get_response()
+            return self._get_response()
 
     async def asend(self, msg: SendMsgType) -> ReceiveMsgType | None:
-        """Send a request to the parent without blocking."""
-        raise NotImplementedError
+        """
+        Send a request to the parent without blocking.
+
+        Uses async lock for coroutine safety and thread lock for socket safety.
+        """
+        frame_bytes = self._make_frame(msg).as_bytes()
+
+        async with self._async_lock:
+            # Acquire the threading lock without blocking the event loop
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._thread_lock.acquire)
+            try:
+                # Async write to socket
+                await loop.sock_sendall(self.socket, frame_bytes)
+
+                if isinstance(msg, ResendLoggingFD):
+                    if recv_fds is None:
+                        return None
+                    # Blocking read in a thread
+                    frame, fds = await asyncio.to_thread(self._read_frame, maxfds=1)
+                    resp = self._from_frame(frame)
+                    if TYPE_CHECKING:
+                        assert isinstance(resp, SentFDs)
+                    resp.fds = fds
+                    return resp  # type: ignore[return-value]
+
+                # Normal blocking read in a thread
+                frame = await asyncio.to_thread(self._read_frame)
+                return self._from_frame(frame)
+            finally:
+                self._thread_lock.release()
 
     @overload
     def _read_frame(self, maxfds: None = None) -> _ResponseFrame: ...
@@ -450,7 +509,7 @@ class XComResult(XComResponse):
 
 class XComCountResponse(BaseModel):
     len: int
-    type: Literal["XComLengthResponse"] = "XComLengthResponse"
+    type: Literal["XComCountResponse"] = "XComCountResponse"
 
 
 class XComSequenceIndexResult(BaseModel):
@@ -502,6 +561,46 @@ class VariableResult(VariableResponse):
         for communication between the Supervisor and the task process.
         """
         return cls(**variable_response.model_dump(exclude_defaults=True), type="VariableResult")
+
+
+class TaskStateResult(TaskStateResponse):
+    """Response to GetTaskState; wraps the generated API response for supervisor to worker comms."""
+
+    type: Literal["TaskStateResult"] = "TaskStateResult"
+
+    @classmethod
+    def from_task_state_response(cls, resp: TaskStateResponse) -> TaskStateResult:
+        return cls(**resp.model_dump(exclude_defaults=True), type="TaskStateResult")
+
+
+class AssetStateResult(AssetStateResponse):
+    """Response to GetAssetState; wraps the generated API response for supervisor to worker comms."""
+
+    type: Literal["AssetStateResult"] = "AssetStateResult"
+
+    @classmethod
+    def from_asset_state_response(cls, resp: AssetStateResponse) -> AssetStateResult:
+        return cls(**resp.model_dump(exclude_defaults=True), type="AssetStateResult")
+
+
+class AssetsByAliasResult(BaseModel):
+    """Response to GetAssetsByAlias; list of concrete assets resolved from an alias."""
+
+    assets: list[AssetResult]
+    type: Literal["AssetsByAliasResult"] = "AssetsByAliasResult"
+
+    @classmethod
+    def from_asset_responses(cls, asset_responses: list[AssetResponse]) -> AssetsByAliasResult:
+        return cls(
+            assets=[AssetResult.from_asset_response(a) for a in asset_responses],
+            type="AssetsByAliasResult",
+        )
+
+
+class VariableKeysResult(BaseModel):
+    keys: list[str]
+    total_entries: int
+    type: Literal["VariableKeysResult"] = "VariableKeysResult"
 
 
 class DagRunResult(DagRun):
@@ -654,23 +753,43 @@ class HITLDetailRequestResult(HITLDetailRequest):
         return cls(**hitl_request.model_dump(exclude_defaults=True), type="HITLDetailRequestResult")
 
 
+class DagResult(DagResponse):
+    type: Literal["DagResult"] = "DagResult"
+
+    @classmethod
+    def from_api_response(cls, dag_response: DagResponse) -> DagResult:
+        """
+        Create result class from API Response.
+
+        API Response is autogenerated from the API schema, so we need to convert it to Result
+        for communication between the Supervisor and the task process since it needs a
+        discriminator field.
+        """
+        return cls(**dag_response.model_dump(exclude_defaults=True), type="DagResult")
+
+
 ToTask = Annotated[
     AssetResult
+    | AssetsByAliasResult
     | AssetEventsResult
+    | AssetStateResult
     | ConnectionResult
     | DagRunResult
     | DagRunStateResult
     | DRCount
+    | DagResult
     | ErrorResponse
     | PrevSuccessfulDagRunResult
     | PreviousTIResult
     | SentFDs
     | StartupDetails
     | TaskRescheduleStartDate
+    | TaskStateResult
     | TICount
     | TaskBreadcrumbsResult
     | TaskStatesResult
     | VariableResult
+    | VariableKeysResult
     | XComCountResponse
     | XComResult
     | XComSequenceIndexResult
@@ -750,7 +869,7 @@ class GetXComCount(BaseModel):
     dag_id: str
     run_id: str
     task_id: str
-    type: Literal["GetNumberXComs"] = "GetNumberXComs"
+    type: Literal["GetXComCount"] = "GetXComCount"
 
 
 class GetXComSequenceItem(BaseModel):
@@ -781,6 +900,7 @@ class SetXCom(BaseModel):
     run_id: str
     task_id: str
     map_index: int | None = None
+    dag_result: bool = False
     mapped_length: int | None = None
     type: Literal["SetXCom"] = "SetXCom"
 
@@ -794,6 +914,80 @@ class DeleteXCom(BaseModel):
     type: Literal["DeleteXCom"] = "DeleteXCom"
 
 
+class GetTaskState(BaseModel):
+    ti_id: UUID
+    key: str
+    type: Literal["GetTaskState"] = "GetTaskState"
+
+
+class SetTaskState(BaseModel):
+    ti_id: UUID
+    key: str
+    value: str
+    expires_at: AwareDatetime | None
+    type: Literal["SetTaskState"] = "SetTaskState"
+
+
+class DeleteTaskState(BaseModel):
+    ti_id: UUID
+    key: str
+    type: Literal["DeleteTaskState"] = "DeleteTaskState"
+
+
+class ClearTaskState(BaseModel):
+    ti_id: UUID
+    all_map_indices: bool = False
+    type: Literal["ClearTaskState"] = "ClearTaskState"
+
+
+class GetAssetStateByName(BaseModel):
+    name: str
+    key: str
+    type: Literal["GetAssetStateByName"] = "GetAssetStateByName"
+
+
+class GetAssetStateByUri(BaseModel):
+    uri: str
+    key: str
+    type: Literal["GetAssetStateByUri"] = "GetAssetStateByUri"
+
+
+class SetAssetStateByName(BaseModel):
+    name: str
+    key: str
+    value: str
+    type: Literal["SetAssetStateByName"] = "SetAssetStateByName"
+
+
+class SetAssetStateByUri(BaseModel):
+    uri: str
+    key: str
+    value: str
+    type: Literal["SetAssetStateByUri"] = "SetAssetStateByUri"
+
+
+class DeleteAssetStateByName(BaseModel):
+    name: str
+    key: str
+    type: Literal["DeleteAssetStateByName"] = "DeleteAssetStateByName"
+
+
+class DeleteAssetStateByUri(BaseModel):
+    uri: str
+    key: str
+    type: Literal["DeleteAssetStateByUri"] = "DeleteAssetStateByUri"
+
+
+class ClearAssetStateByName(BaseModel):
+    name: str
+    type: Literal["ClearAssetStateByName"] = "ClearAssetStateByName"
+
+
+class ClearAssetStateByUri(BaseModel):
+    uri: str
+    type: Literal["ClearAssetStateByUri"] = "ClearAssetStateByUri"
+
+
 class GetConnection(BaseModel):
     conn_id: str
     type: Literal["GetConnection"] = "GetConnection"
@@ -802,6 +996,13 @@ class GetConnection(BaseModel):
 class GetVariable(BaseModel):
     key: str
     type: Literal["GetVariable"] = "GetVariable"
+
+
+class GetVariableKeys(BaseModel):
+    prefix: str | None = None
+    limit: int = 1000
+    offset: int = 0
+    type: Literal["GetVariableKeys"] = "GetVariableKeys"
 
 
 class PutVariable(BaseModel):
@@ -881,6 +1082,11 @@ class GetAssetByName(BaseModel):
 class GetAssetByUri(BaseModel):
     uri: str
     type: Literal["GetAssetByUri"] = "GetAssetByUri"
+
+
+class GetAssetsByAlias(BaseModel):
+    alias_name: str
+    type: Literal["GetAssetsByAlias"] = "GetAssetsByAlias"
 
 
 class GetAssetEventByAsset(BaseModel):
@@ -978,25 +1184,42 @@ class MaskSecret(BaseModel):
     type: Literal["MaskSecret"] = "MaskSecret"
 
 
+class GetDag(BaseModel):
+    dag_id: str
+    type: Literal["GetDag"] = "GetDag"
+
+
 ToSupervisor = Annotated[
-    DeferTask
+    ClearAssetStateByName
+    | ClearAssetStateByUri
+    | ClearTaskState
+    | DeferTask
+    | DeleteAssetStateByName
+    | DeleteAssetStateByUri
+    | DeleteTaskState
     | DeleteXCom
     | GetAssetByName
     | GetAssetByUri
+    | GetAssetsByAlias
     | GetAssetEventByAsset
     | GetAssetEventByAssetAlias
+    | GetAssetStateByName
+    | GetAssetStateByUri
     | GetConnection
     | GetDagRun
     | GetDagRunState
     | GetDRCount
+    | GetDag
     | GetPrevSuccessfulDagRun
     | GetPreviousDagRun
     | GetPreviousTI
     | GetTaskRescheduleStartDate
+    | GetTaskState
     | GetTICount
     | GetTaskBreadcrumbs
     | GetTaskStates
     | GetVariable
+    | GetVariableKeys
     | GetXCom
     | GetXComCount
     | GetXComSequenceItem
@@ -1004,8 +1227,11 @@ ToSupervisor = Annotated[
     | PutVariable
     | RescheduleTask
     | RetryTask
+    | SetAssetStateByName
+    | SetAssetStateByUri
     | SetRenderedFields
     | SetRenderedMapIndex
+    | SetTaskState
     | SetXCom
     | SkipDownstreamTasks
     | SucceedTask

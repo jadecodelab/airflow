@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 import pkgutil
 import sys
@@ -43,6 +44,33 @@ if TYPE_CHECKING:
     from types import ModuleType
 
 
+def accepts_context(callback: Callable) -> bool:
+    """Check if callback accepts a 'context' parameter or **kwargs."""
+    try:
+        sig = inspect.signature(callback)
+    except (ValueError, TypeError):
+        return True
+    params = sig.parameters
+    return "context" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def accepts_keyword_args(func: Callable) -> bool:
+    """Check if a callable accepts any keyword arguments (named params or **kwargs)."""
+    try:
+        sig = inspect.signature(func)
+    except (ValueError, TypeError):
+        return True
+    return any(
+        p.kind
+        in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.VAR_KEYWORD,
+        )
+        for p in sig.parameters.values()
+    )
+
+
 def import_string(dotted_path: str):
     """
     Import a dotted module path and return the attribute/class designated by the last name in the path.
@@ -63,9 +91,24 @@ def import_string(dotted_path: str):
         raise ImportError(f'Module "{module_path}" does not define a "{class_name}" attribute/class')
 
 
-def qualname(o: object | Callable, use_qualname: bool = False) -> str:
-    """Convert an attribute/class/callable to a string importable by ``import_string``."""
+def qualname(o: object | Callable, use_qualname: bool = False, exclude_module: bool = False) -> str:
+    """
+    Convert an attribute/class/callable to a string.
+
+    By default, returns a string importable by ``import_string`` (includes module path).
+    With exclude_module=True, returns only the qualified name without module prefix,
+    useful for stable identification across deployments where module paths may vary.
+    """
     if callable(o) and hasattr(o, "__module__"):
+        if exclude_module:
+            if hasattr(o, "__qualname__"):
+                return o.__qualname__
+            if hasattr(o, "__name__"):
+                return o.__name__
+            # Handle functools.partial objects specifically (not just any object with 'func' attr)
+            if isinstance(o, functools.partial):
+                return qualname(o.func, exclude_module=True)
+            return type(o).__qualname__
         if use_qualname and hasattr(o, "__qualname__"):
             return f"{o.__module__}.{o.__qualname__}"
         if hasattr(o, "__name__"):
@@ -78,6 +121,9 @@ def qualname(o: object | Callable, use_qualname: bool = False) -> str:
 
     name = cls.__qualname__
     module = cls.__module__
+
+    if exclude_module:
+        return name
 
     if module and module != "__builtin__":
         return f"{module}.{name}"

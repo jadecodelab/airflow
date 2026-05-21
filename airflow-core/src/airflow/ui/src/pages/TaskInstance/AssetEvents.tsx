@@ -25,17 +25,18 @@ import { useAssetServiceGetAssetEvents, useTaskInstanceServiceGetMappedTaskInsta
 import { AssetEvents as AssetEventsTable } from "src/components/Assets/AssetEvents";
 import { useTableURLState } from "src/components/DataTable/useTableUrlState";
 import { SearchBar } from "src/components/SearchBar";
-import { SearchParamsKeys } from "src/constants/searchParams";
+import { SearchParamsKeys, type SearchParamsKeysType } from "src/constants/searchParams";
+import { useAdvancedSearch } from "src/hooks/useAdvancedSearch";
 import { isStatePending, useAutoRefresh } from "src/utils";
 
 export const AssetEvents = () => {
   const { dagId = "", mapIndex = "-1", runId = "", taskId = "" } = useParams();
+  const { NAME_PATTERN, OFFSET }: SearchParamsKeysType = SearchParamsKeys;
   const [searchParams, setSearchParams] = useSearchParams();
   const { t: translate } = useTranslation(["assets"]);
 
-  const [assetNameSearch, setAssetNameSearch] = useState(
-    searchParams.get(SearchParamsKeys.NAME_PATTERN) ?? "",
-  );
+  const [assetNameSearch, setAssetNameSearch] = useState(searchParams.get(NAME_PATTERN) ?? "");
+  const advancedSearch = useAdvancedSearch("asset-events");
 
   const parsedMapIndex = parseInt(mapIndex, 10);
 
@@ -65,10 +66,11 @@ export const AssetEvents = () => {
       pagination: { ...pagination, pageIndex: 0 },
     });
     if (value) {
-      searchParams.set(SearchParamsKeys.NAME_PATTERN, value);
+      searchParams.set(NAME_PATTERN, value);
     } else {
-      searchParams.delete(SearchParamsKeys.NAME_PATTERN);
+      searchParams.delete(NAME_PATTERN);
     }
+    searchParams.delete(OFFSET);
     setSearchParams(searchParams);
   };
 
@@ -85,7 +87,9 @@ export const AssetEvents = () => {
   const { data: assetEventsData, isLoading } = useAssetServiceGetAssetEvents(
     {
       limit: pagination.pageSize,
-      namePattern: assetNameSearch || undefined,
+      ...(advancedSearch.enabled
+        ? { namePattern: assetNameSearch || undefined }
+        : { namePrefixPattern: assetNameSearch || undefined }),
       offset: pagination.pageIndex * pagination.pageSize,
       orderBy,
       sourceDagId: dagId,
@@ -103,6 +107,7 @@ export const AssetEvents = () => {
     <Box>
       <Box maxWidth="500px" mb={4}>
         <SearchBar
+          advancedSearch={advancedSearch}
           defaultValue={assetNameSearch}
           hotkeyDisabled
           onChange={handleSearchChange}

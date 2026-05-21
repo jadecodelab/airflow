@@ -93,6 +93,142 @@ Additionally, in the ``elasticsearch_configs`` section, you can pass any paramet
     api_key = "SOMEAPIKEY"
     verify_certs = True
 
+Pinning the ``compatible-with`` content-negotiation level
+'''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+Since provider 6.5.1, the Elasticsearch dependency is ``elasticsearch>=8.10,<10``,
+which means a default install resolves to an ``elasticsearch>=9`` Python client.
+That client unconditionally negotiates ``compatible-with=9`` on every request,
+which Elasticsearch 8.x servers reject with HTTP 400
+``media_type_header_exception``. Both the task log writer and the
+``ElasticsearchSQLHook`` / ``ElasticsearchPythonHook`` are affected.
+
+If you need to keep a single Airflow image compatible with an
+``elasticsearch<9`` server, set ``[elasticsearch] es_compat_with`` to the server
+major version. The provider then rewrites the client transport so every outbound
+request carries ``Accept`` / ``Content-Type:
+application/vnd.elasticsearch+json; compatible-with=<major>`` (and the matching
+``+x-ndjson`` form for bulk requests):
+
+.. code-block:: ini
+
+    [elasticsearch]
+    es_compat_with = 8
+
+Only a positive integer major version is accepted (``"7"``, ``"8"``, ``"9"``);
+any other value (e.g. ``"v8"``, ``"8.0"``) fails fast with an
+``AirflowConfigException`` at client construction time so the misconfiguration
+is obvious in the worker startup log instead of producing a per-request 400
+storm.
+
+.. note::
+
+   The fix is installed at the **transport layer** (a wrapper around
+   ``client.transport.perform_request``) and therefore overrides the
+   per-API-method ``Accept`` / ``Content-Type`` headers that elasticsearch-py
+   negotiates from its own client major. Constructor-level ``headers=`` on
+   ``Elasticsearch.__init__`` and the ``elasticsearch_configs`` section do
+   **not** work for this purpose — elasticsearch-py re-applies its own
+   ``compatible-with=<client_major>`` headers right before the request goes
+   out, after any constructor headers.
+
+When the option is unset the client behaves as before (negotiating its own
+major version).
+
+.. _elasticsearch-document-schema:
+
+Expected Elasticsearch document schema
+'''''''''''''''''''''''''''''''''''''''
+
+When using an external log shipper (Fluent Bit, Fluentd, Logstash, etc.) to index task logs into
+Elasticsearch, each document must contain certain fields for Airflow to retrieve and render logs correctly.
+
+**Required fields**
+
+``log_id``
+    Identifies which task instance a log line belongs to. The value must match the
+    ``[elasticsearch] log_id_template`` setting.
+
+``offset``
+    A monotonically increasing integer that defines the ordering of log lines within a single task attempt.
+    The field name can be customized with the ``offset_field`` handler parameter.
+
+``event``
+    The log message text. This is the primary field used by Airflow 3 to display log content.
+    If ``event`` is absent, Airflow falls back to the ``message`` field automatically, which preserves
+    compatibility with Airflow 2.x log formats.
+
+**Optional fields**
+
+The following fields are recognized and displayed by the Airflow UI when present:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 60 20
+
+   * - Field
+     - Description
+     - Notes
+   * - ``timestamp``
+     - ISO-8601 timestamp of the log line.
+     - ``@timestamp`` is mapped to ``timestamp`` automatically.
+   * - ``level``
+     - Log level (e.g. ``INFO``, ``WARNING``, ``ERROR``).
+     - ``levelname`` is mapped to ``level`` automatically.
+   * - ``chan``
+     - The logging channel name.
+     -
+   * - ``logger``
+     - The logger name that produced the record.
+     -
+   * - ``error_detail``
+     - Structured traceback written by the Airflow 3 task supervisor.
+     - Empty values are ignored.
+   * - ``message``
+     - Log message text (Airflow 2.x convention).
+     - Used as fallback when ``event`` is absent.
+   * - ``host``
+     - The hostname of the worker that produced the log. Used to group log lines by source.
+     - Field name can be customized with the ``host_field`` handler parameter.
+
+**Field mappings**
+
+Airflow applies the following automatic mappings when reading documents, so your log shipper can use
+either form:
+
+- ``@timestamp`` → ``timestamp``
+- ``levelname`` → ``level``
+- ``message`` → ``event`` (only when ``event`` is not present)
+
+**Minimal document example**
+
+The smallest document that will render correctly in the Airflow UI:
+
+.. code-block:: json
+
+    {
+      "log_id": "my_dag-my_task-manual__2025-06-01T00:00:00+00:00-0-1",
+      "offset": 1,
+      "event": "Task execution started"
+    }
+
+**Full document example**
+
+A document using all recognized fields:
+
+.. code-block:: json
+
+    {
+      "log_id": "my_dag-my_task-manual__2025-06-01T00:00:00+00:00-0-1",
+      "offset": 1,
+      "event": "Task execution started",
+      "timestamp": "2025-06-01T00:00:01.123Z",
+      "level": "INFO",
+      "chan": "task",
+      "logger": "airflow.task",
+      "host": "worker-01"
+    }
+
 .. _log-link-elasticsearch:
 
 Elasticsearch External Link

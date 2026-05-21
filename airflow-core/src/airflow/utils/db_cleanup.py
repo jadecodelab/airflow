@@ -26,8 +26,10 @@ from __future__ import annotations
 import csv
 import logging
 import os
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import and_, column, func, inspect, select, table, text
@@ -47,7 +49,8 @@ from airflow.utils.types import DagRunType
 
 if TYPE_CHECKING:
     from pendulum import DateTime
-    from sqlalchemy.orm import Query, Session
+    from sqlalchemy import Select
+    from sqlalchemy.orm import Session
 
     from airflow.models import Base
 
@@ -170,6 +173,7 @@ config_list: list[_TableConfig] = [
         keep_last_group_by=["dag_id"],
     ),
     _TableConfig(table_name="deadline", recency_column_name="deadline_time", dag_id_column_name="dag_id"),
+    _TableConfig(table_name="revoked_token", recency_column_name="exp"),
 ]
 
 # We need to have `fallback="database"` because this is executed at top level code and provider configuration
@@ -183,8 +187,8 @@ if (
 config_dict: dict[str, _TableConfig] = {x.orm_model.name: x for x in sorted(config_list)}
 
 
-def _check_for_rows(*, query: Query, print_rows: bool = False) -> int:
-    num_entities = query.count()
+def _check_for_rows(*, session: Session, query: Select, print_rows: bool = False) -> int:
+    num_entities = session.scalars(select(func.count()).select_from(query.subquery())).one()
     print(f"Found {num_entities} rows meeting deletion criteria.")
     if not print_rows or num_entities == 0:
         return num_entities
@@ -192,7 +196,7 @@ def _check_for_rows(*, query: Query, print_rows: bool = False) -> int:
     max_rows_to_print = 100
     print(f"Printing first {max_rows_to_print} rows.")
     logger.debug("print entities query: %s", query)
-    for entry in query.limit(max_rows_to_print):
+    for entry in session.execute(query.limit(max_rows_to_print)):
         print(entry.__dict__)
     return num_entities
 
@@ -213,7 +217,7 @@ def _dump_table_to_file(*, target_table: str, file_path: str, export_format: str
 
 
 def _do_delete(
-    *, query: Query, orm_model: Base, skip_archive: bool, session: Session, batch_size: int | None
+    *, query: Select, orm_model: Base, skip_archive: bool, session: Session, batch_size: int | None
 ) -> None:
     import itertools
     import re
@@ -224,7 +228,9 @@ def _do_delete(
 
     while True:
         limited_query = query.limit(batch_size) if batch_size else query
-        if limited_query.count() == 0:  # nothing left to delete
+        if (
+            session.scalars(select(func.count()).select_from(limited_query.subquery())).one() == 0
+        ):  # nothing left to delete
             break
 
         batch_no = next(batch_counter)
@@ -290,13 +296,17 @@ def _do_delete(
 
 
 def _subquery_keep_last(
-    *, recency_column, keep_last_filters, group_by_columns, max_date_colname, session: Session
+    *,
+    recency_column,
+    keep_last_filters,
+    group_by_columns,
+    max_date_colname,
 ):
     subquery = select(*group_by_columns, func.max(recency_column).label(max_date_colname))
 
     if keep_last_filters is not None:
         for entry in keep_last_filters:
-            subquery = subquery.filter(entry)
+            subquery = subquery.where(entry)
 
     if group_by_columns is not None:
         subquery = subquery.group_by(*group_by_columns)
@@ -332,10 +342,10 @@ def _build_query(
     dag_ids: list[str] | None = None,
     exclude_dag_ids: list[str] | None = None,
     **kwargs,
-) -> Query:
+) -> Select:
     base_table_alias = "base"
     base_table = aliased(orm_model, name=base_table_alias)
-    query = session.query(base_table).with_entities(text(f"{base_table_alias}.*"))
+    query = select(text(f"{base_table_alias}.*")).select_from(base_table)
     base_table_recency_col = base_table.c[recency_column.name]
     conditions = [base_table_recency_col < clean_before_timestamp]
 
@@ -355,9 +365,8 @@ def _build_query(
             keep_last_filters=keep_last_filters,
             group_by_columns=group_by_columns,
             max_date_colname=max_date_col_name,
-            session=session,
         )
-        query = query.select_from(base_table).outerjoin(
+        query = query.outerjoin(
             subquery,
             and_(
                 *[base_table.c[x] == subquery.c[x] for x in keep_last_group_by],  # type: ignore[attr-defined]
@@ -365,7 +374,7 @@ def _build_query(
             ),
         )
         conditions.append(column(max_date_col_name).is_(None))
-    query = query.filter(and_(*conditions))
+    query = query.where(and_(*conditions))
     return query
 
 
@@ -404,7 +413,7 @@ def _cleanup_table(
     )
     logger.debug("old rows query:\n%s", query.selectable.compile())
     print(f"Checking table {orm_model.name}")
-    num_rows = _check_for_rows(query=query, print_rows=False)
+    num_rows = _check_for_rows(session=session, query=query, print_rows=False)
 
     if num_rows and not dry_run:
         _do_delete(
@@ -468,11 +477,22 @@ def _print_config(*, configs: dict[str, _TableConfig]) -> None:
 
 
 @contextmanager
-def _suppress_with_logging(table: str, session: Session):
-    """Suppresses errors but logs them."""
+def _suppress_with_logging(table: str, session: Session) -> Generator[SimpleNamespace, None, None]:
+    """
+    Suppress per-table cleanup errors, log them, and expose failure state to the caller.
+
+    Yields a :class:`~types.SimpleNamespace` with a single attribute ``failed`` (bool).
+    When an :class:`~sqlalchemy.exc.OperationalError` or
+    :class:`~sqlalchemy.exc.ProgrammingError` is raised inside the ``with`` block the
+    exception is swallowed, ``ctx.failed`` is set to ``True``, a WARNING is emitted for
+    the table, and the session is rolled back.  The caller can inspect ``ctx.failed``
+    after the block to decide whether to surface the error upstream.
+    """
+    ctx = SimpleNamespace(failed=False)
     try:
-        yield
+        yield ctx
     except (OperationalError, ProgrammingError):
+        ctx.failed = True
         logger.warning("Encountered error when attempting to clean table '%s'. ", table)
         logger.debug("Traceback for table '%s'", table, exc_info=True)
         if session.is_active:
@@ -547,6 +567,7 @@ def run_cleanup(
     skip_archive: bool = False,
     session: Session = NEW_SESSION,
     batch_size: int | None = None,
+    error_on_cleanup_failure: bool = False,
 ) -> None:
     """
     Purges old records in airflow metadata database.
@@ -570,6 +591,9 @@ def run_cleanup(
     :param skip_archive: Set to True if you don't want the purged rows preserved in an archive table.
     :param session: Session representing connection to the metadata database.
     :param batch_size: Maximum number of rows to delete or archive in a single transaction.
+    :param error_on_cleanup_failure: If True, raise a RuntimeError after processing all tables
+        if any per-table cleanup encountered an error. By default errors are suppressed, a warning
+        summary is logged, and the command exits 0 even if some tables were not cleaned.
     """
     clean_before_timestamp = timezone.coerce_datetime(clean_before_timestamp)
 
@@ -590,10 +614,11 @@ def run_cleanup(
             exclude_dag_ids=exclude_dag_ids,
         )
     existing_tables = reflect_tables(tables=None, session=session).tables
+    failed_tables: list[str] = []
 
     for table_name, table_config in effective_config_dict.items():
         if table_name in existing_tables:
-            with _suppress_with_logging(table_name, session):
+            with _suppress_with_logging(table_name, session) as ctx:
                 _cleanup_table(
                     clean_before_timestamp=clean_before_timestamp,
                     dag_ids=dag_ids,
@@ -605,9 +630,21 @@ def run_cleanup(
                     session=session,
                     batch_size=batch_size,
                 )
-                session.commit()
+            if ctx.failed:
+                failed_tables.append(table_name)
         else:
             logger.warning("Table %s not found.  Skipping.", table_name)
+
+    if failed_tables:
+        if error_on_cleanup_failure:
+            raise RuntimeError(
+                f"airflow db clean encountered errors on the following tables and did not clean them: "
+                f"{failed_tables}. Check the logs above for details."
+            )
+        logger.warning(
+            "The following tables were not cleaned due to errors: %s. Check the logs above for details.",
+            failed_tables,
+        )
 
 
 @provide_session

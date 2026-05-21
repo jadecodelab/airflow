@@ -38,7 +38,7 @@ from tests_common.test_utils.config import conf_vars
 from tests_common.test_utils.dag import sync_dag_to_db
 from tests_common.test_utils.db import clear_db_dag_bundles, clear_db_dags, clear_db_runs
 from tests_common.test_utils.taskinstance import create_task_instance
-from tests_common.test_utils.version_compat import AIRFLOW_V_3_0_PLUS
+from tests_common.test_utils.version_compat import AIRFLOW_V_3_0_PLUS, AIRFLOW_V_3_2_2_PLUS
 
 try:
     from airflow.sdk.timezone import datetime
@@ -270,6 +270,8 @@ class TestS3TaskHandler:
         assert not self.s3_task_handler.upload_on_close
         mock_open.assert_not_called()
 
+    # TODO: Remove when we stop testing for 2.11 compatibility
+    @conf_vars({("core", "use_historical_filename_templates"): "True"})
     def test_set_context_not_raw(self):
         mock_open = mock.mock_open()
         with mock.patch("airflow.providers.amazon.aws.log.s3_task_handler.open", mock_open):
@@ -279,6 +281,8 @@ class TestS3TaskHandler:
         mock_open.assert_called_once_with(os.path.join(self.local_log_location, "1.log"), "w")
         mock_open().write.assert_not_called()
 
+    # TODO: Remove when we stop testing for 2.11 compatibility
+    @conf_vars({("core", "use_historical_filename_templates"): "True"})
     def test_read(self):
         # Test what happens when we have two log files to read
         self.conn.put_object(Bucket="bucket", Key=self.remote_log_key, Body=b"Log line\nLine 2\n")
@@ -291,7 +295,17 @@ class TestS3TaskHandler:
 
         expected_s3_uri = f"s3://bucket/{self.remote_log_key}"
 
-        if AIRFLOW_V_3_0_PLUS:
+        if AIRFLOW_V_3_2_2_PLUS:
+            log = list(log)
+            assert log[0].event == "::group::Log message source details"
+            assert expected_s3_uri in log[1].event
+            assert log[3].event == "::endgroup::"
+            assert log[4].event == "Log line"
+            assert log[5].event == "Line 2"
+            assert log[6].event == "Log line 3"
+            assert log[7].event == "Line 4"
+            assert metadata == {"end_of_log": True, "log_pos": 4}
+        elif AIRFLOW_V_3_0_PLUS:
             log = list(log)
             assert log[0].event == "::group::Log message source details"
             assert expected_s3_uri in log[0].sources
@@ -324,6 +338,8 @@ class TestS3TaskHandler:
             assert expected in actual
             assert metadata[0] == {"end_of_log": True, "log_pos": 0}
 
+    # TODO: Remove when we stop testing for 2.11 compatibility
+    @conf_vars({("core", "use_historical_filename_templates"): "True"})
     def test_close(self):
         self.s3_task_handler.set_context(self.ti)
         assert self.s3_task_handler.upload_on_close

@@ -21,7 +21,6 @@ import importlib
 import json
 import logging
 import os
-import platform
 import re
 import subprocess
 import sys
@@ -53,7 +52,8 @@ if TYPE_CHECKING:
     from airflow.sdk.execution_time.task_runner import RuntimeTaskInstance
     from airflow.sdk.types import DagRunProtocol, Operator
     from airflow.serialization.definitions.dag import SerializedDAG
-    from airflow.timetables.base import DataInterval
+    from airflow.timetables.base import DagRunInfo, DataInterval
+    from airflow.triggers.base import StartTriggerArgs
     from airflow.typing_compat import Self
     from airflow.utils.state import DagRunState, TaskInstanceState
 
@@ -161,7 +161,7 @@ UPDATE_PROVIDER_DEPENDENCIES_SCRIPT = (
 
 # Deliberately copied from breeze - we want to keep it in sync but we do not want to import code from
 # Breeze here as we want to do it quickly
-ALL_PYPROJECT_TOML_FILES = []
+ALL_PYPROJECT_TOML_FILES: list[Path] = []
 
 
 def get_all_provider_pyproject_toml_provider_yaml_files() -> Generator[Path, None, None]:
@@ -225,11 +225,15 @@ os.environ["AIRFLOW__CORE__DAGS_FOLDER"] = os.fspath(AIRFLOW_CORE_TESTS_PATH / "
 os.environ["AIRFLOW__CORE__UNIT_TEST_MODE"] = "True"
 os.environ["AWS_DEFAULT_REGION"] = os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
 os.environ["CREDENTIALS_DIR"] = os.environ.get("CREDENTIALS_DIR") or "/files/airflow-breeze-config/keys"
-
-if platform.system() == "Darwin":
-    # mocks from unittest.mock work correctly in subprocesses only if they are created by "fork" method
-    # but macOS uses "spawn" by default
-    os.environ["AIRFLOW__CORE__MP_START_METHOD"] = "fork"
+# PyJWT 2.12.0 (2026-03-12) added strict type validation that rejects iss=None.
+# Current main's airflow-core deletes iss from the claims when the configured
+# `[api_auth] jwt_issuer` is falsy (commit a440d1db93, 2026-01-31), but the
+# `Compat 3.0.x` matrix tests install older airflow-core releases (e.g. 3.0.6,
+# 2025-08-25) that predate that fix. Setting a default test issuer here keeps
+# every JWT-generating test path safe across all supported airflow-core versions
+# without leaking the upper bound to user-facing dependencies. Tests that need
+# to override this still can via `conf_vars(...)`.
+os.environ.setdefault("AIRFLOW__API_AUTH__JWT_ISSUER", "test-airflow-issuer")
 
 
 @pytest.fixture
@@ -386,6 +390,12 @@ def pytest_addoption(parser: pytest.Parser):
         help="Disable internal capture warnings.",
     )
     group.addoption(
+        "--load-config",
+        action="store",
+        dest="load_config",
+        help="[DANGER] Load an airflow config file instead of test environment defaults [DANGER]",
+    )
+    group.addoption(
         "--warning-output-path",
         action="store",
         dest="warning_output_path",
@@ -414,6 +424,19 @@ def initialize_airflow_tests(request):
     airflow_home = os.environ.get("AIRFLOW_HOME") or os.path.join(home, "airflow")
 
     print(f"Home of the user: {home}\nAirflow home {airflow_home}")
+
+    if request.config.option.load_config:
+        from airflow.configuration import AIRFLOW_CONFIG, conf, load_standard_airflow_configuration
+
+        saved_af_conf = AIRFLOW_CONFIG
+        AIRFLOW_CONFIG = request.config.option.load_config
+        try:
+            load_standard_airflow_configuration(conf)
+        except:
+            raise
+        finally:
+            AIRFLOW_CONFIG = saved_af_conf
+        conf.validate()
 
     if not skip_db_tests and not request.config.option.no_db_init:
         _initialize_airflow_db(request.config.option.db_init, airflow_home)
@@ -641,37 +664,6 @@ def skip_quarantined_test(item):
         )
 
 
-def skip_db_test(item):
-    if next(item.iter_markers(name="db_test"), None):
-        if next(item.iter_markers(name="non_db_test_override"), None):
-            # non_db_test can override the db_test set for example on module or class level
-            return
-        pytest.skip(
-            f"The test is skipped as it is DB test and --skip-db-tests is flag is passed to pytest. {item}"
-        )
-    if next(item.iter_markers(name="backend"), None):
-        # also automatically skip tests marked with `backend` marker as they are implicitly
-        # db tests
-        pytest.skip(
-            f"The test is skipped as it is DB test and --skip-db-tests is flag is passed to pytest. {item}"
-        )
-
-
-def only_run_db_test(item):
-    if next(item.iter_markers(name="db_test"), None) and not next(
-        item.iter_markers(name="non_db_test_override"), None
-    ):
-        # non_db_test at individual level can override the db_test set for example on module or class level
-        return
-    if next(item.iter_markers(name="backend"), None):
-        # Also do not skip the tests marked with `backend` marker - as it is implicitly a db test
-        return
-    pytest.skip(
-        f"The test is skipped as it is not a DB tests "
-        f"and --run-db-tests-only flag is passed to pytest. {item}"
-    )
-
-
 def skip_if_integration_disabled(marker, item):
     integration_name = marker.args[0]
     environment_variable_name = "INTEGRATION_" + integration_name.upper()
@@ -718,6 +710,43 @@ def skip_if_credential_file_missing(item):
             pytest.skip(f"The test requires credential file {credential_path}: {item}")
 
 
+def _is_db_test(item) -> bool:
+    """Check if a test item should be treated as a DB test."""
+    if next(item.iter_markers(name="db_test"), None):
+        if next(item.iter_markers(name="non_db_test_override"), None):
+            return False
+        return True
+    if next(item.iter_markers(name="backend"), None):
+        return True
+    return False
+
+
+def pytest_collection_modifyitems(config, items):
+    """Deselect DB/non-DB tests early so pytest-xdist workers never receive them.
+
+    Previously these tests were skipped at runtime via pytest_runtest_setup, which
+    still required every xdist worker to import the test modules. With thousands of
+    DB tests being skipped in non-DB runs, this caused excessive memory usage — enough
+    to OOM on Python 3.14 CI runners. Deselecting during collection avoids distributing
+    these items to workers entirely.
+    """
+    if not skip_db_tests and not run_db_tests_only:
+        return
+
+    selected = []
+    deselected = []
+    for item in items:
+        is_db = _is_db_test(item)
+        if (skip_db_tests and is_db) or (run_db_tests_only and not is_db):
+            deselected.append(item)
+        else:
+            selected.append(item)
+
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = selected
+
+
 def pytest_runtest_setup(item):
     selected_integrations_list = item.config.option.integration
 
@@ -743,10 +772,6 @@ def pytest_runtest_setup(item):
         skip_long_running_test(item)
     if not include_quarantined:
         skip_quarantined_test(item)
-    if skip_db_tests:
-        skip_db_test(item)
-    if run_db_tests_only:
-        only_run_db_test(item)
     skip_if_credential_file_missing(item)
 
 
@@ -928,7 +953,11 @@ def dag_maker(request) -> Generator[DagMaker, None, None]:
                 class DAGProxy(lazy_object_proxy.Proxy):
                     """Wrapper to make test patterns work with serialized dag."""
 
-                    task = factory.dag.task  # Expose the @dag.task decorator.
+                    @property
+                    def task(self):
+                        # Forward explicitly so Proxy binding does not leak the proxy
+                        # instance into the decorator callable on Python 3.14.
+                        return factory.dag.task
 
                     # When adding a task to the dag, automatically re-serialize.
                     def add_task(self, task):
@@ -978,7 +1007,13 @@ def dag_maker(request) -> Generator[DagMaker, None, None]:
                     AssetModel.producing_tasks.any(TaskOutletAssetReference.dag_id == self.dag.dag_id),
                 )
 
-            assets = self.session.scalars(select(AssetModel).where(assets_select_condition)).all()
+            assets = select(AssetModel).where(assets_select_condition).cte()
+
+            if not AIRFLOW_V_3_2_PLUS:
+                assets = self.session.scalars(
+                    select(AssetModel).join(assets, AssetModel.id == AssetModel.id)
+                ).all()
+
             SchedulerJobRunner._activate_referenced_assets(assets, session=self.session)
 
         def __exit__(self, type, value, traceback):
@@ -1065,7 +1100,7 @@ def dag_maker(request) -> Generator[DagMaker, None, None]:
             from airflow.utils.state import DagRunState
             from airflow.utils.types import DagRunType
 
-            timezone = _import_timezone()
+            airflow_timezone = _import_timezone()
 
             if AIRFLOW_V_3_0_PLUS:
                 from airflow.utils.types import DagRunTriggeredByType
@@ -1100,8 +1135,12 @@ def dag_maker(request) -> Generator[DagMaker, None, None]:
                 if run_type == DagRunType.MANUAL:
                     logical_date = self.start_date
                 else:
-                    logical_date = dag.next_dagrun_info(None).logical_date
-            logical_date = timezone.coerce_datetime(logical_date)
+                    if AIRFLOW_V_3_2_PLUS:
+                        next_run_kwargs = dict(last_automated_run_info=None)
+                    else:
+                        next_run_kwargs = dict(last_automated_dagrun=None)
+                    logical_date = dag.next_dagrun_info(**next_run_kwargs).logical_date
+            logical_date = airflow_timezone.coerce_datetime(logical_date)
 
             data_interval = None
             try:
@@ -1125,13 +1164,15 @@ def dag_maker(request) -> Generator[DagMaker, None, None]:
                     if AIRFLOW_V_3_0_PLUS:
                         kwargs["run_id"] = dag.timetable.generate_run_id(
                             run_type=run_type,
-                            run_after=logical_date or timezone.coerce_datetime(timezone.utcnow()),
+                            run_after=logical_date
+                            or airflow_timezone.coerce_datetime(airflow_timezone.utcnow()),
                             data_interval=data_interval,
                         )
                     else:
                         kwargs["run_id"] = dag.timetable.generate_run_id(
                             run_type=run_type,
-                            logical_date=logical_date or timezone.coerce_datetime(timezone.utcnow()),
+                            logical_date=logical_date
+                            or airflow_timezone.coerce_datetime(airflow_timezone.utcnow()),
                             data_interval=data_interval,
                         )
             kwargs["run_type"] = run_type
@@ -1139,7 +1180,9 @@ def dag_maker(request) -> Generator[DagMaker, None, None]:
             if AIRFLOW_V_3_0_PLUS:
                 kwargs.setdefault("triggered_by", DagRunTriggeredByType.TEST)
                 kwargs["logical_date"] = logical_date
-                kwargs.setdefault("run_after", data_interval[-1] if data_interval else timezone.utcnow())
+                kwargs.setdefault(
+                    "run_after", data_interval[-1] if data_interval else airflow_timezone.utcnow()
+                )
             else:
                 kwargs.pop("triggered_by", None)
                 kwargs["execution_date"] = logical_date
@@ -1158,15 +1201,33 @@ def dag_maker(request) -> Generator[DagMaker, None, None]:
             if AIRFLOW_V_3_1_PLUS:
                 from airflow.models.dag import get_run_data_interval
 
-                next_info = sdag.next_dagrun_info(get_run_data_interval(sdag.timetable, dagrun))
+                interval = get_run_data_interval(sdag.timetable, dagrun)
+                last_run_info = self._get_run_info(dagrun, sdag, interval)
+                next_info = sdag.next_dagrun_info(last_automated_run_info=last_run_info)
             else:
-                next_info = sdag.next_dagrun_info(sdag.get_run_data_interval(dagrun))
+                interval = sdag.get_run_data_interval(dagrun)
+                last_run_info = self._get_run_info(dagrun, sdag, interval)
+                next_info = sdag.next_dagrun_info(last_automated_run_info=last_run_info)
             if next_info is None:
                 raise ValueError(f"cannot create run after {dagrun}")
             return self.create_dagrun(
                 logical_date=next_info.logical_date,
                 data_interval=next_info.data_interval,
                 **kwargs,
+            )
+
+        def _get_run_info(self, dagrun: DagRun, serdag: SerializedDAG, interval: DataInterval) -> DagRunInfo:
+            from airflow.timetables.base import DagRunInfo
+
+            if AIRFLOW_V_3_2_PLUS:
+                return serdag.timetable.run_info_from_dag_run(dag_run=dagrun)
+
+            airflow_timezone = _import_timezone()
+            return DagRunInfo(
+                run_after=airflow_timezone.coerce_datetime(dagrun.run_after),
+                data_interval=interval,
+                partition_date=None,
+                partition_key=None,
             )
 
         def create_ti(self, task_id, dag_run=None, dag_run_kwargs=None, map_index=-1):
@@ -1532,6 +1593,9 @@ def create_task_instance(
         hostname=None,
         pid=None,
         last_heartbeat_at=None,
+        task: Operator | None = None,
+        start_from_trigger: bool = False,
+        start_trigger_args: StartTriggerArgs | None = None,
         **kwargs,
     ) -> TaskInstance:
         timezone = _import_timezone()
@@ -1540,26 +1604,33 @@ def create_task_instance(
         if logical_date is NOTSET:
             # For now: default to having a logical date if None is not explicitly passed.
             logical_date = timezone.utcnow()
-        with dag_maker(dag_id, **kwargs):
+        with dag_maker(dag_id, **kwargs) as dag:
             op_kwargs = {}
             op_kwargs["task_display_name"] = task_display_name
-            task = EmptyOperator(
-                task_id=task_id,
-                max_active_tis_per_dag=max_active_tis_per_dag,
-                max_active_tis_per_dagrun=max_active_tis_per_dagrun,
-                executor_config=executor_config or {},
-                on_success_callback=on_success_callback,
-                on_execute_callback=on_execute_callback,
-                on_failure_callback=on_failure_callback,
-                on_retry_callback=on_retry_callback,
-                on_skipped_callback=on_skipped_callback,
-                inlets=inlets,
-                outlets=outlets,
-                email=email,
-                pool=pool,
-                trigger_rule=trigger_rule,
-                **op_kwargs,
-            )
+            if not task:
+                task = EmptyOperator(
+                    task_id=task_id,
+                    max_active_tis_per_dag=max_active_tis_per_dag,
+                    max_active_tis_per_dagrun=max_active_tis_per_dagrun,
+                    executor_config=executor_config or {},
+                    on_success_callback=on_success_callback,
+                    on_execute_callback=on_execute_callback,
+                    on_failure_callback=on_failure_callback,
+                    on_retry_callback=on_retry_callback,
+                    on_skipped_callback=on_skipped_callback,
+                    inlets=inlets,
+                    outlets=outlets,
+                    email=email,
+                    pool=pool,
+                    trigger_rule=trigger_rule,
+                    **op_kwargs,
+                )
+            else:
+                task_id = task.task_id
+                task.dag = dag
+            task.start_from_trigger = start_from_trigger
+            task.start_trigger_args = start_trigger_args
+
         if AIRFLOW_V_3_0_PLUS:
             dagrun_kwargs = {
                 "logical_date": logical_date,
@@ -1816,7 +1887,7 @@ def clear_lru_cache():
         return
 
     try:
-        from airflow._shared.module_loading import _get_grouped_entry_points
+        from airflow_shared.module_loading import _get_grouped_entry_points
     except ImportError:
         # compat for airflow < 3.2
         from airflow.utils.entry_points import _get_grouped_entry_points
@@ -1888,6 +1959,17 @@ def cleanup_providers_manager():
     finally:
         ProvidersManager()._cleanup()
         ProvidersManager().initialize_providers_configuration()
+
+
+@pytest.fixture
+def cleanup_providers_manager_runtime():
+    from airflow.sdk.providers_manager_runtime import ProvidersManagerTaskRuntime
+
+    ProvidersManagerTaskRuntime()._cleanup()
+    try:
+        yield
+    finally:
+        ProvidersManagerTaskRuntime()._cleanup()
 
 
 @pytest.fixture(autouse=True)
@@ -1969,17 +2051,30 @@ def _mock_plugins(request: pytest.FixtureRequest):
 
 @pytest.fixture
 def hook_lineage_collector():
-    from airflow.lineage.hook import HookLineageCollector
+    from airflow.providers.common.compat.sdk import HookLineageCollector
+
+    from tests_common.test_utils.version_compat import AIRFLOW_V_3_0_PLUS, AIRFLOW_V_3_2_PLUS
 
     hlc = HookLineageCollector()
-    with mock.patch(
-        "airflow.lineage.hook.get_hook_lineage_collector",
-        return_value=hlc,
-    ):
-        # Redirect calls to compat provider to support back-compat tests of 2.x as well
+
+    if AIRFLOW_V_3_0_PLUS:
+        from unittest import mock
+
+        patch_target = "airflow.lineage.hook.get_hook_lineage_collector"
+        if AIRFLOW_V_3_2_PLUS:
+            patch_target = "airflow.sdk.lineage.get_hook_lineage_collector"
+
+        with mock.patch(patch_target, return_value=hlc):
+            from airflow.providers.common.compat.lineage.hook import get_hook_lineage_collector
+
+            yield get_hook_lineage_collector()
+    else:
+        from airflow.lineage import hook
         from airflow.providers.common.compat.lineage.hook import get_hook_lineage_collector
 
+        hook._hook_lineage_collector = hlc
         yield get_hook_lineage_collector()
+        hook._hook_lineage_collector = None
 
 
 @pytest.fixture
@@ -2446,7 +2541,6 @@ def create_runtime_ti(mocked_parse):
         run_type: str = "manual",
         try_number: int = 1,
         map_index: int | None = -1,
-        upstream_map_indexes: dict[str, int | list[int] | None] | None = None,
         task_reschedule_count: int = 0,
         ti_id: UUID | None = None,
         conf: dict[str, Any] | None = None,
@@ -2496,7 +2590,8 @@ def create_runtime_ti(mocked_parse):
             )
             if drinfo:
                 data_interval = drinfo.data_interval
-                data_interval_start, data_interval_end = data_interval.start, data_interval.end
+                data_interval_start = data_interval and data_interval.start
+                data_interval_end = data_interval and data_interval.end
 
         dag_id = task.dag.dag_id
         task_retries = task.retries or 0
@@ -2521,11 +2616,7 @@ def create_runtime_ti(mocked_parse):
             task_reschedule_count=task_reschedule_count,
             max_tries=task_retries if max_tries is None else max_tries,
             should_retry=should_retry if should_retry is not None else try_number <= task_retries,
-            upstream_map_indexes=upstream_map_indexes,
         )
-
-        if upstream_map_indexes is not None:
-            ti_context.upstream_map_indexes = upstream_map_indexes
 
         compat_fields = {
             "requests_fd": 0,

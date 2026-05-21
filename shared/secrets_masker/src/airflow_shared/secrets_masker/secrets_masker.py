@@ -50,20 +50,28 @@ log = logging.getLogger(__name__)
 
 DEFAULT_SENSITIVE_FIELDS = frozenset(
     {
+        "access_key",
         "access_token",
         "api_key",
         "apikey",
+        "auth_header",
         "authorization",
+        "bearer",
+        "connection_string",
+        "dsn",
         "passphrase",
         "passwd",
         "password",
         "private_key",
         "proxy",
+        "proxy_password",
         "proxies",
         "secret",
+        "service_account",
+        "service_key",
         "token",
         "keyfile_dict",
-        "service_account",
+        "webhook_url",
     }
 )
 """Names of fields (Connection extra, Variable key name etc.) that are deemed sensitive"""
@@ -257,15 +265,38 @@ class SecretsMasker(logging.Filter):
         )
         return frozenset(record.__dict__).difference({"msg", "args"})
 
-    def _redact_exception_with_context(self, exception):
+    def _redact_exception_with_context_or_cause(self, exception, visited=None):
         # Exception class may not be modifiable (e.g. declared by an
         # extension module such as JDBC).
         with contextlib.suppress(AttributeError):
-            exception.args = (self.redact(v) for v in exception.args)
-        if exception.__context__:
-            self._redact_exception_with_context(exception.__context__)
-        if exception.__cause__ and exception.__cause__ is not exception.__context__:
-            self._redact_exception_with_context(exception.__cause__)
+            if visited is None:
+                visited = set()
+
+            if id(exception) in visited:
+                # already visited - it was redacted earlier
+                return exception
+
+            # Check depth before adding to visited to ensure we skip exceptions beyond the limit
+            if len(visited) >= self.MAX_RECURSION_DEPTH:
+                return RuntimeError(
+                    f"Stack trace redaction hit recursion limit of {self.MAX_RECURSION_DEPTH} "
+                    f"when processing exception of type {type(exception).__name__}. "
+                    f"The remaining exceptions will be skipped to avoid "
+                    f"infinite recursion and protect against revealing sensitive information."
+                )
+
+            visited.add(id(exception))
+
+            exception.args = tuple(self.redact(v) for v in exception.args)
+            if exception.__context__:
+                exception.__context__ = self._redact_exception_with_context_or_cause(
+                    exception.__context__, visited
+                )
+            if exception.__cause__ and exception.__cause__ is not exception.__context__:
+                exception.__cause__ = self._redact_exception_with_context_or_cause(
+                    exception.__cause__, visited
+                )
+        return exception
 
     def filter(self, record) -> bool:
         if not self.is_log_masking_enabled():
@@ -282,7 +313,7 @@ class SecretsMasker(logging.Filter):
                     record.__dict__[k] = self.redact(v)
             if record.exc_info and record.exc_info[1] is not None:
                 exc = record.exc_info[1]
-                self._redact_exception_with_context(exc)
+                self._redact_exception_with_context_or_cause(exc)
         record.__dict__[self.ALREADY_FILTERED_FLAG] = True
 
         return True
@@ -318,14 +349,18 @@ class SecretsMasker(logging.Filter):
     def _redact(
         self, item: Redactable, name: str | None, depth: int, max_depth: int, replacement: str = "***"
     ) -> Redacted:
-        # Avoid spending too much effort on redacting on deeply nested
-        # structures. This also avoid infinite recursion if a structure has
-        # reference to self.
-        if depth > max_depth:
-            return item
         try:
+            # Key-name-based redaction is unbounded by depth — sensitive keys
+            # must fail closed at any nesting level. The depth cutoff below is
+            # only used to bound the work of pattern-based string masking and
+            # to terminate recursion through self-referential iterables.
             if name and self.should_hide_value_for_key(name):
                 return self._redact_all(item, depth, max_depth, replacement=replacement)
+            # Always walk dicts so deeper sensitive keys are still caught;
+            # JSON-loaded payloads cannot be self-referential, and any
+            # in-memory cycle hits Python's own recursion limit and is caught
+            # by the except clause below (which fails closed via
+            # "<redaction-failed>").
             if isinstance(item, dict):
                 to_return = {
                     dict_key: self._redact(
@@ -334,6 +369,10 @@ class SecretsMasker(logging.Filter):
                     for dict_key, subval in item.items()
                 }
                 return to_return
+            # Avoid spending too much effort on pattern-based masking of
+            # deeply nested non-dict structures.
+            if depth > max_depth:
+                return item
             if isinstance(item, Enum):
                 return self._redact(
                     item=item.value, name=name, depth=depth, max_depth=max_depth, replacement=replacement

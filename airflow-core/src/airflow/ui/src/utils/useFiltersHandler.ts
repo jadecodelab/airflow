@@ -58,7 +58,9 @@ const handleDateRangeChange = (
 export type FilterableSearchParamsKeys =
   | SearchParamsKeys.ASSET_EVENT_DATE_RANGE
   | SearchParamsKeys.BODY_SEARCH
+  | SearchParamsKeys.BUNDLE_VERSION
   | SearchParamsKeys.CONF_CONTAINS
+  | SearchParamsKeys.CONSUMING_ASSET_PATTERN
   | SearchParamsKeys.CREATED_AT_RANGE
   | SearchParamsKeys.DAG_DISPLAY_NAME_PATTERN
   | SearchParamsKeys.DAG_ID
@@ -66,21 +68,29 @@ export type FilterableSearchParamsKeys =
   | SearchParamsKeys.DAG_VERSION
   | SearchParamsKeys.DURATION_GTE
   | SearchParamsKeys.DURATION_LTE
+  | SearchParamsKeys.END_DATE_RANGE
   | SearchParamsKeys.EVENT_DATE_RANGE
   | SearchParamsKeys.EVENT_TYPE
+  | SearchParamsKeys.EXECUTOR_CLASS
+  | SearchParamsKeys.HOSTNAME
+  | SearchParamsKeys.JOB_STATE
+  | SearchParamsKeys.JOB_TYPE
   | SearchParamsKeys.KEY_PATTERN
   | SearchParamsKeys.LOGICAL_DATE_RANGE
   | SearchParamsKeys.MAP_INDEX
   | SearchParamsKeys.NAME_PATTERN
   | SearchParamsKeys.OPERATOR_NAME_PATTERN
+  | SearchParamsKeys.PARTITION_KEY_PATTERN
   | SearchParamsKeys.POOL_NAME_PATTERN
   | SearchParamsKeys.QUEUE_NAME_PATTERN
+  | SearchParamsKeys.RENDERED_MAP_INDEX
   | SearchParamsKeys.RESPONDED_BY_USER_NAME
   | SearchParamsKeys.RESPONSE_RECEIVED
   | SearchParamsKeys.RUN_AFTER_RANGE
   | SearchParamsKeys.RUN_ID
   | SearchParamsKeys.RUN_ID_PATTERN
   | SearchParamsKeys.RUN_TYPE
+  | SearchParamsKeys.START_DATE_RANGE
   | SearchParamsKeys.STATE
   | SearchParamsKeys.SUBJECT_SEARCH
   | SearchParamsKeys.TASK_ID
@@ -136,6 +146,7 @@ export const useFiltersHandler = (searchParamKeys: Array<FilterableSearchParamsK
 
   const handleFiltersChange = (filters: Record<string, FilterValue>) => {
     setTableURLState({
+      cursor: undefined,
       pagination: { ...pagination, pageIndex: 0 },
       sorting,
     });
@@ -158,6 +169,7 @@ export const useFiltersHandler = (searchParamKeys: Array<FilterableSearchParamsK
       });
 
       newParams.delete(SearchParamsKeys.OFFSET);
+      newParams.delete(SearchParamsKeys.CURSOR);
 
       return newParams;
     });

@@ -20,7 +20,7 @@ from __future__ import annotations
 import datetime
 import logging
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .protocols import Timer
 from .validators import (
@@ -45,16 +45,16 @@ class SafeDogStatsdLogger:
     def __init__(
         self,
         dogstatsd_client: DogStatsd,
-        metrics_validator: ListValidator = PatternAllowListValidator(),
+        metrics_validator: ListValidator | None = None,
         metrics_tags: bool = False,
-        metric_tags_validator: ListValidator = PatternAllowListValidator(),
+        metric_tags_validator: ListValidator | None = None,
         stat_name_handler: Callable[[str], str] | None = None,
         statsd_influxdb_enabled: bool = False,
     ) -> None:
         self.dogstatsd = dogstatsd_client
-        self.metrics_validator = metrics_validator
+        self.metrics_validator = metrics_validator or PatternAllowListValidator()
         self.metrics_tags = metrics_tags
-        self.metric_tags_validator = metric_tags_validator
+        self.metric_tags_validator = metric_tags_validator or PatternAllowListValidator()
         self.stat_name_handler = stat_name_handler
         self.statsd_influxdb_enabled = statsd_influxdb_enabled
 
@@ -160,7 +160,6 @@ class SafeDogStatsdLogger:
 
 
 def get_dogstatsd_logger(
-    cls,
     *,
     tags_in_string: str | None = None,
     host: str | None = None,
@@ -176,8 +175,8 @@ def get_dogstatsd_logger(
     """Get DataDog StatsD logger."""
     from datadog import DogStatsd
 
-    dogstatsd_kwargs: dict[str, str | int | list[str]] = {
-        "constant_tags": cls.get_constant_tags(tags_in_string=tags_in_string),
+    dogstatsd_kwargs: dict[str, Any] = {
+        "constant_tags": tags_in_string.split(",") if tags_in_string else [],
     }
     if host is not None:
         dogstatsd_kwargs["host"] = host

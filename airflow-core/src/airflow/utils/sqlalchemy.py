@@ -22,13 +22,13 @@ import copy
 import datetime
 import logging
 from collections.abc import Generator
-from importlib import metadata
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from packaging import version
-from sqlalchemy import TIMESTAMP, PickleType, event, nullsfirst
+from sqlalchemy import TIMESTAMP, PickleType, String, event, nullsfirst
 from sqlalchemy.dialects import mysql
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.sql.functions import FunctionElement
 from sqlalchemy.types import JSON, Text, TypeDecorator
 
 from airflow._shared.timezones.timezone import make_naive, utc
@@ -50,21 +50,39 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-try:
-    from sqlalchemy.orm import mapped_column
-except ImportError:
-    # fallback for SQLAlchemy < 2.0
-    def mapped_column(*args, **kwargs):  # type: ignore[misc]
-        from sqlalchemy import Column
-
-        return Column(*args, **kwargs)
-
 
 def get_dialect_name(session: Session) -> str | None:
     """Safely get the name of the dialect associated with the given session."""
     if (bind := session.get_bind()) is None:
         raise ValueError("No bind/engine is associated with the provided Session")
     return getattr(bind.dialect, "name", None)
+
+
+class random_db_uuid(FunctionElement):
+    """
+    Cross-dialect random UUID generation for use in SQL expressions.
+
+    Compiles to ``gen_random_uuid()`` on PostgreSQL, ``UUID()`` on MySQL,
+    and ``uuid4()`` on SQLite (registered via :func:`setup_event_handlers`).
+    """
+
+    type = String()
+    inherit_cache = True
+
+
+@compiles(random_db_uuid, "postgresql")
+def _random_db_uuid_pg(element, compiler, **kw):
+    return "gen_random_uuid()"
+
+
+@compiles(random_db_uuid, "mysql")
+def _random_db_uuid_mysql(element, compiler, **kw):
+    return "UUID()"
+
+
+@compiles(random_db_uuid, "sqlite")
+def _random_db_uuid_sqlite(element, compiler, **kw):
+    return "uuid4()"
 
 
 class UtcDateTime(TypeDecorator):
@@ -330,14 +348,14 @@ USE_ROW_LEVEL_LOCKING: bool = conf.getboolean("scheduler", "use_row_level_lockin
 
 
 def with_row_locks(
-    query: Select[Any],
+    query: Select,
     session: Session,
     *,
     nowait: bool = False,
     skip_locked: bool = False,
     key_share: bool = True,
     **kwargs,
-) -> Select[Any]:
+) -> Select:
     """
     Apply with_for_update to the SQLAlchemy query if row level locking is in use.
 
@@ -468,17 +486,6 @@ def is_lock_not_available_error(error: OperationalError):
     return False
 
 
-def get_orm_mapper():
-    """Get the correct ORM mapper for the installed SQLAlchemy version."""
-    import sqlalchemy.orm.mapper
-
-    return sqlalchemy.orm.mapper if is_sqlalchemy_v1() else sqlalchemy.orm.Mapper
-
-
-def is_sqlalchemy_v1() -> bool:
-    return version.parse(metadata.version("sqlalchemy")).major == 1
-
-
 def make_dialect_kwarg(dialect: str) -> dict[str, str | Iterable[str]]:
     """Create an SQLAlchemy-version-aware dialect keyword argument."""
-    return {"dialect_name": dialect} if is_sqlalchemy_v1() else {"dialect_names": (dialect,)}
+    return {"dialect_names": (dialect,)}

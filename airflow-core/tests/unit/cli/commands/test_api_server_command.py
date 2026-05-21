@@ -193,9 +193,10 @@ class TestCliApiServer(_CommonCLIUvicornTestClass):
                     "timeout_keep_alive": args.worker_timeout,
                     "timeout_graceful_shutdown": args.worker_timeout,
                     "timeout_worker_healthcheck": args.worker_timeout,
-                    "access_log": True,
+                    "access_log": False,
                     "log_level": "info",
                     "proxy_headers": args.proxy_headers,
+                    "log_config": None,
                     **expected_additional_kwargs,
                 },
             )
@@ -246,9 +247,10 @@ class TestCliApiServer(_CommonCLIUvicornTestClass):
             timeout_worker_healthcheck=60,
             ssl_keyfile=None,
             ssl_certfile=None,
-            access_log=True,
+            access_log=False,
             log_level="info",
             proxy_headers=False,
+            log_config=None,
         )
 
         if demonize:
@@ -300,7 +302,7 @@ class TestCliApiServer(_CommonCLIUvicornTestClass):
                 ]
         else:
             assert mock_daemon.mock_calls == []
-            mock_setup_locations.mock_calls == []
+            assert mock_setup_locations.mock_calls == []
             mock_pid_file.assert_not_called()
             mock_open.assert_not_called()
 

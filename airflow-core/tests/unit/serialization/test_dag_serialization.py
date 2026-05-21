@@ -22,6 +22,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import dataclasses
+import functools
 import importlib
 import importlib.util
 import json
@@ -81,6 +82,7 @@ from airflow.serialization.json_schema import load_dag_schema_dict
 from airflow.serialization.serialized_objects import (
     BaseSerialization,
     DagSerialization,
+    LazyDeserializedDAG,
     OperatorSerialization,
     _XComRef,
 )
@@ -93,6 +95,7 @@ from airflow.task.priority_strategy import (
 from airflow.ti_deps.deps.ready_to_reschedule import ReadyToRescheduleDep
 from airflow.timetables.simple import NullTimetable, OnceTimetable
 from airflow.triggers.base import StartTriggerArgs
+from airflow.utils.types import DagRunType
 
 from tests_common.test_utils.config import conf_vars
 from tests_common.test_utils.markers import skip_if_force_lowest_dependencies_marker, skip_if_not_on_main
@@ -103,11 +106,16 @@ from tests_common.test_utils.mock_operators import (
     GithubLink,
     MockOperator,
 )
+from tests_common.test_utils.providers import (
+    IGNORE_MODULE_IMPORT_ERRORS,
+    get_suspended_providers_folders,
+)
 from tests_common.test_utils.timetables import (
     CustomSerializationTimetable,
     cron_timetable,
     delta_timetable,
 )
+from unit.models import TEST_DAGS_FOLDER
 
 if TYPE_CHECKING:
     from airflow.sdk.definitions.context import Context
@@ -214,6 +222,7 @@ serialized_simple_dag_ground_truth = {
         "is_paused_upon_creation": False,
         "dag_id": "simple_dag",
         "deadline": None,
+        "allowed_run_types": None,
         "doc_md": "### DAG Tutorial Documentation",
         "fileloc": None,
         "_processor_dags_folder": (
@@ -250,6 +259,7 @@ serialized_simple_dag_ground_truth = {
                         },
                     },
                     "doc_md": "### Task Tutorial Documentation",
+                    "has_retry_policy": False,
                     "_needs_expansion": False,
                     "inlets": [
                         {
@@ -291,6 +301,7 @@ serialized_simple_dag_ground_truth = {
                     "task_type": "CustomOperator",
                     "_operator_name": "@custom",
                     "_task_module": "tests_common.test_utils.mock_operators",
+                    "has_retry_policy": False,
                     "_needs_expansion": False,
                 },
             },
@@ -324,6 +335,13 @@ serialized_simple_dag_ground_truth = {
             },
         ],
         "params": [],
+        # These fields have no schema default; they are always emitted on the wire
+        # because their real default comes from airflow.cfg at parse time.
+        "catchup": False,
+        "disable_bundle_versioning": False,
+        "max_active_runs": 16,
+        "max_active_tasks": 16,
+        "max_consecutive_failed_dag_runs": 0,
     },
 }
 
@@ -423,8 +441,8 @@ def get_excluded_patterns() -> Generator[str, None, None]:
         (AIRFLOW_REPO_ROOT_PATH / "generated" / "provider_dependencies.json").read_text()
     )
     for provider, provider_info in all_providers.items():
+        provider_path = provider.replace(".", "/")
         if python_version in provider_info.get("excluded-python-versions"):
-            provider_path = provider.replace(".", "/")
             yield f"providers/{provider_path}"
     current_python_version = sys.version_info[:2]
     if current_python_version >= (3, 13):
@@ -454,9 +472,12 @@ def collect_dags(dag_folder=None):
             patterns = dag_folder
         else:
             patterns = [dag_folder]
+    suspended_providers_path = get_suspended_providers_folders()
+
     excluded_patterns = [
         f"{AIRFLOW_REPO_ROOT_PATH}/{excluded_pattern}" for excluded_pattern in get_excluded_patterns()
-    ]
+    ] + suspended_providers_path
+
     with mock.patch("airflow.dag_processing.dagbag.settings.get_dagbag_import_timeout", return_value=60):
         for pattern in patterns:
             for directory in glob(f"{AIRFLOW_REPO_ROOT_PATH}/{pattern}"):
@@ -550,6 +571,11 @@ class TestStringifiedDAGs:
             # This "looks" like a problem, but is just a quirk of the parse-all-dags-in-one-process we do
             # in this test
             if "AirflowDagDuplicatedIdException: Ignoring DAG example_sagemaker" not in error
+            # Ignore module import errors for any suspended provider paths used in example dags
+            if any(
+                f"{ignore_module_import_error}" not in error
+                for ignore_module_import_error in IGNORE_MODULE_IMPORT_ERRORS
+            )
         }
 
         # Let's not be exact about this, but if everything fails to parse we should fail this test too
@@ -687,6 +713,43 @@ class TestStringifiedDAGs:
         for dag_id in stringified_dags:
             self.validate_deserialized_dag(stringified_dags[dag_id], dags[dag_id])
 
+    @pytest.mark.db_test
+    @conf_vars({("core", "load_examples"): "false"})
+    def test_reserialize_should_make_equal_hash_with_dag_processor(self):
+        dagbag1 = DagBag(TEST_DAGS_FOLDER / "test_dag_decorator_version.py")
+        hash_result1 = LazyDeserializedDAG.from_dag(next(iter(dagbag1.dags.values()))).hash
+
+        dagbag2 = DagBag(TEST_DAGS_FOLDER / "test_dag_decorator_version.py")
+        hash_result2 = LazyDeserializedDAG.from_dag(next(iter(dagbag2.dags.values()))).hash
+
+        assert hash_result1 == hash_result2
+
+    @pytest.mark.db_test
+    @conf_vars({("core", "load_examples"): "false"})
+    def test_hash_succeeds_for_dag_with_mixed_primitive_key_template_field(self):
+        """SerializedDagModel.hash() must not raise on a template field whose dict has mixed-type primitive keys.
+
+        Building the Dag twice via ``create_dag()`` produces independent Dag and
+        operator instances, so the hashes must also be equal across calls —
+        otherwise the serialization path is leaking non-deterministic state
+        (memory addresses, dict ordering, etc.) into the hash.
+        """
+        from airflow.providers.standard.operators.python import PythonOperator
+
+        def create_dag():
+            with DAG(dag_id="dag_mixed_keys", schedule=None, start_date=datetime(2024, 1, 1)) as dag:
+                PythonOperator(
+                    task_id="op",
+                    python_callable=empty_function,
+                    op_kwargs={"data": {1: "a", "b": "c", None: "z", 2: "d"}, empty_function: "t"},
+                )
+            return dag
+
+        first_hash = LazyDeserializedDAG.from_dag(create_dag()).hash
+        second_hash = LazyDeserializedDAG.from_dag(create_dag()).hash
+
+        assert first_hash == second_hash
+
     @skip_if_force_lowest_dependencies_marker
     @pytest.mark.db_test
     def test_roundtrip_provider_example_dags(self):
@@ -800,6 +863,8 @@ class TestStringifiedDAGs:
                 "on_failure_fail_dagrun",
                 "_needs_expansion",
                 "_is_sensor",
+                # trigger_kwargs is kept as raw JSON after deserialization; checked separately
+                "start_trigger_args",
             }
         else:  # Promised to be mapped by the assert above.
             assert isinstance(serialized_task, SerializedMappedOperator)
@@ -840,6 +905,20 @@ class TestStringifiedDAGs:
         else:
             assert serialized_task.resources == task.resources
 
+        # start_trigger_args: trigger_kwargs is kept as raw BaseSerialization-encoded form
+        # after deserialization. Compare the encoded forms directly — s.trigger_kwargs is
+        # exactly BaseSerialization.serialize(o.trigger_kwargs) since _encode_start_trigger_args
+        # serializes it and _decode_start_trigger_args keeps it raw.
+        if task.start_trigger_args is not None:
+            from airflow.serialization.serialized_objects import BaseSerialization
+
+            s = serialized_task.start_trigger_args
+            o = task.start_trigger_args
+            assert s.trigger_cls == o.trigger_cls
+            assert s.next_method == o.next_method
+            assert s.timeout == o.timeout
+            assert s.trigger_kwargs == BaseSerialization.serialize(o.trigger_kwargs or {})
+
         assert [ensure_serialized_asset(i) for i in task.inlets] == serialized_task.inlets
         assert [ensure_serialized_asset(o) for o in task.outlets] == serialized_task.outlets
 
@@ -863,9 +942,9 @@ class TestStringifiedDAGs:
         if isinstance(task, MappedOperator):
             # MappedOperator.operator_class now stores only minimal type information
             # for memory efficiency (task_type and _operator_name).
-            serialized_task.operator_class["task_type"] == type(task).__name__
+            assert serialized_task.operator_class["task_type"] == task.operator_class.__name__
             if isinstance(serialized_task.operator_class, DecoratedOperator):
-                serialized_task.operator_class["_operator_name"] == task._operator_name
+                assert serialized_task.operator_class["_operator_name"] == task._operator_name
 
             # Serialization cleans up default values in partial_kwargs, this
             # adds them back to both sides.
@@ -1552,6 +1631,7 @@ class TestStringifiedDAGs:
             "has_on_retry_callback": False,
             "has_on_skipped_callback": False,
             "has_on_success_callback": False,
+            "has_retry_policy": False,
             "ignore_first_depends_on_past": False,
             "is_setup": False,
             "is_teardown": False,
@@ -1568,6 +1648,7 @@ class TestStringifiedDAGs:
             "pool_slots": 1,
             "priority_weight": 1,
             "queue": "default",
+            "render_template_as_native_obj": None,
             "resources": None,
             "retries": 0,
             "retry_delay": timedelta(0, 300),
@@ -2351,6 +2432,29 @@ class TestStringifiedDAGs:
             assert deserialized_dag.disable_bundle_versioning is expected
 
     @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (True, True),
+            (False, False),
+            (None, None),
+        ],
+    )
+    def test_dag_rerun_with_latest_version_roundtrip(self, value, expected):
+        """Test that rerun_with_latest_version survives serialization roundtrip."""
+        kwargs = {}
+        if value is not None:
+            kwargs["rerun_with_latest_version"] = value
+        dag = DAG(
+            dag_id="test_dag_rerun_with_latest_version_roundtrip",
+            schedule=None,
+            **kwargs,
+        )
+        BaseOperator(task_id="simple_task", dag=dag, start_date=datetime(2019, 8, 1))
+        serialized_dag = DagSerialization.to_dict(dag)
+        deserialized_dag = DagSerialization.from_dict(serialized_dag)
+        assert deserialized_dag.rerun_with_latest_version is expected
+
+    @pytest.mark.parametrize(
         ("object_to_serialized", "expected_output"),
         [
             (
@@ -2610,6 +2714,42 @@ class TestStringifiedDAGs:
             "timeout": None,
         }
         assert tasks[1]["__var"]["start_from_trigger"] is True
+
+    def test_trigger_kwargs_not_deserialised_through_serdag(self):
+        """trigger_kwargs and next_kwargs are kept as raw BaseSerialization JSON when loading a serialized DAG."""
+
+        class TestOperator(BaseOperator):
+            start_trigger_args = StartTriggerArgs(
+                trigger_cls="airflow.providers.standard.triggers.temporal.TimeDeltaTrigger",
+                trigger_kwargs={"delta": timedelta(seconds=2)},
+                next_method="execute_complete",
+                next_kwargs={"resume_after": timedelta(seconds=5)},
+                timeout=None,
+            )
+            start_from_trigger = True
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+
+            def execute_complete(self):
+                pass
+
+        dag = DAG(dag_id="test_dag_kwargs_raw", schedule=None, start_date=datetime(2023, 11, 9))
+        with dag:
+            TestOperator(task_id="test_task")
+
+        serialized = DagSerialization.to_dict(dag)
+        deserialized_dag = DagSerialization.from_dict(serialized)
+
+        task = deserialized_dag.get_task("test_task")
+        assert task.start_trigger_args.trigger_kwargs == {
+            "__type": "dict",
+            "__var": {"delta": {"__type": "timedelta", "__var": 2.0}},
+        }
+        assert task.start_trigger_args.next_kwargs == {
+            "__type": "dict",
+            "__var": {"resume_after": {"__type": "timedelta", "__var": 5.0}},
+        }
 
 
 def test_kubernetes_optional():
@@ -2934,7 +3074,7 @@ def test_taskflow_expand_serde():
         },
         "_disallow_kwargs_override": False,
         "_expand_input_attr": "op_kwargs_expand_input",
-        "python_callable_name": qualname(x),
+        "python_callable_name": "test_taskflow_expand_serde.<locals>.x",
     }
 
     deserialized = BaseSerialization.deserialize(serialized)
@@ -3001,7 +3141,7 @@ def test_taskflow_expand_kwargs_serde(strict):
         "_task_module": "airflow.providers.standard.decorators.python",
         "task_type": "_PythonDecoratedOperator",
         "_operator_name": "@task",
-        "python_callable_name": qualname(x),
+        "python_callable_name": "test_taskflow_expand_kwargs_serde.<locals>.x",
         "partial_kwargs": {
             "op_args": [],
             "op_kwargs": {
@@ -3172,11 +3312,42 @@ def test_python_callable_in_partial_kwargs():
 
     serialized = OperatorSerialization.serialize_mapped_operator(operator)
     assert "python_callable" not in serialized["partial_kwargs"]
-    assert serialized["partial_kwargs"]["python_callable_name"] == qualname(empty_function)
+    assert serialized["partial_kwargs"]["python_callable_name"] == "empty_function"
 
     deserialized = OperatorSerialization.deserialize_operator(serialized)
     assert "python_callable" not in deserialized.partial_kwargs
-    assert deserialized.partial_kwargs["python_callable_name"] == qualname(empty_function)
+    assert deserialized.partial_kwargs["python_callable_name"] == "empty_function"
+
+
+def test_python_callable_name_uses_qualname_exclude_module():
+    """Test python_callable_name is stable across bundle version changes."""
+    from airflow.providers.standard.operators.python import PythonOperator
+
+    # Module-level function
+    op1 = PythonOperator(task_id="task1", python_callable=empty_function)
+    serialized1 = OperatorSerialization.serialize_operator(op1)
+    assert serialized1["python_callable_name"] == "empty_function"
+
+    # Nested function
+    def outer():
+        def inner():
+            pass
+
+        return inner
+
+    inner_func = outer()
+    op2 = PythonOperator(task_id="task2", python_callable=inner_func)
+    serialized2 = OperatorSerialization.serialize_operator(op2)
+    assert (
+        serialized2["python_callable_name"]
+        == "test_python_callable_name_uses_qualname_exclude_module.<locals>.outer.<locals>.inner"
+    )
+
+    # functools.partial
+    partial_func = functools.partial(empty_function, x=1)
+    op3 = PythonOperator(task_id="task3", python_callable=partial_func)
+    serialized3 = OperatorSerialization.serialize_operator(op3)
+    assert serialized3["python_callable_name"] == "empty_function"
 
 
 def test_handle_v1_serdag():
@@ -3703,13 +3874,14 @@ def test_dag_schema_defaults_optimization():
     dag_with_defaults = DAG(
         dag_id="test_defaults_dag",
         start_date=datetime(2023, 1, 1),
-        # These should match schema defaults and be excluded
-        catchup=False,
+        # These match remaining schema defaults and should be excluded
         fail_fast=False,
+        render_template_as_native_obj=False,
+        # These are config-driven: no schema default, always emitted on the wire
+        catchup=False,
         max_active_runs=16,
         max_active_tasks=16,
         max_consecutive_failed_dag_runs=0,
-        render_template_as_native_obj=False,
         disable_bundle_versioning=False,
         # These should be excluded as None
         description=None,
@@ -3724,6 +3896,16 @@ def test_dag_schema_defaults_optimization():
     for field in DagSerialization.get_schema_defaults("dag").keys():
         assert field not in dag_data, f"Schema default field '{field}' should be excluded"
 
+    # Config-driven fields have no schema default and are always present on the wire
+    for field in (
+        "catchup",
+        "max_active_runs",
+        "max_active_tasks",
+        "max_consecutive_failed_dag_runs",
+        "disable_bundle_versioning",
+    ):
+        assert field in dag_data, f"Config-driven field '{field}' must always be serialised"
+
     # None fields should also be excluded
     none_fields = ["description", "doc_md"]
     for field in none_fields:
@@ -3732,7 +3914,8 @@ def test_dag_schema_defaults_optimization():
     # Test deserialization restores defaults correctly
     deserialized_dag = DagSerialization.from_dict(serialized)
 
-    # Verify schema defaults are restored
+    # Verify values round-trip correctly: schema-default fields are restored from the schema,
+    # config-driven fields are read directly from the wire.
     assert deserialized_dag.catchup is False
     assert deserialized_dag.fail_fast is False
     assert deserialized_dag.max_active_runs == 16
@@ -3760,6 +3943,72 @@ def test_dag_schema_defaults_optimization():
     assert dag_non_defaults_data["max_active_runs"] == 32
     assert "description" in dag_non_defaults_data
     assert dag_non_defaults_data["description"] == "Test description"
+
+
+@pytest.mark.parametrize(
+    ("cfg_overrides", "dag_kwargs", "expected_wire"),
+    [
+        pytest.param(
+            {
+                ("core", "max_active_runs_per_dag"): "1",
+                ("core", "max_active_tasks_per_dag"): "1",
+                ("core", "max_consecutive_failed_dag_runs_per_dag"): "1",
+            },
+            {
+                "dag_id": "test_dag_fields_cfg_ne_user",
+                "max_active_runs": 16,
+                "max_active_tasks": 16,
+                "max_consecutive_failed_dag_runs": 0,
+            },
+            {"max_active_runs": 16, "max_active_tasks": 16, "max_consecutive_failed_dag_runs": 0},
+            id="user_value_differs_from_cfg",
+        ),
+        pytest.param(
+            {
+                ("core", "max_active_runs_per_dag"): "16",
+                ("core", "max_active_tasks_per_dag"): "16",
+                ("core", "max_consecutive_failed_dag_runs_per_dag"): "0",
+            },
+            {
+                "dag_id": "test_dag_fields_cfg_eq_user",
+                "max_active_runs": 16,
+                "max_active_tasks": 16,
+                "max_consecutive_failed_dag_runs": 0,
+            },
+            {"max_active_runs": 16, "max_active_tasks": 16, "max_consecutive_failed_dag_runs": 0},
+            id="user_value_equals_cfg",
+        ),
+        pytest.param(
+            {("scheduler", "catchup_by_default"): "True"},
+            {"dag_id": "test_dag_catchup_override", "catchup": False},
+            {"catchup": False},
+            id="catchup_false_with_catchup_by_default_true",
+        ),
+        pytest.param(
+            {("dag_processor", "disable_bundle_versioning"): "False"},
+            {"dag_id": "test_dag_disable_bundle_versioning", "disable_bundle_versioning": True},
+            {"disable_bundle_versioning": True},
+            id="disable_bundle_versioning_true_with_cfg_false",
+        ),
+    ],
+)
+def test_dag_config_driven_fields_always_serialized(cfg_overrides, dag_kwargs, expected_wire):
+    """Config-driven DAG fields are always present on the wire regardless of the airflow.cfg value.
+
+    Fields like max_active_runs and other config-driven fields were silently dropped during
+    serialisation when their value matched the schema default, regardless of what airflow.cfg
+    was set to. #55849 excluded any field whose value matched the schema default.
+    """
+    with conf_vars(cfg_overrides):
+        dag = DAG(start_date=datetime(2023, 1, 1), **dag_kwargs)
+        serialized = DagSerialization.to_dict(dag)
+
+    for field, value in expected_wire.items():
+        assert serialized["dag"][field] == value
+
+    lazy_dag = LazyDeserializedDAG(data=serialized)
+    for field, value in expected_wire.items():
+        assert getattr(lazy_dag, field) == value
 
 
 def test_email_optimization_removes_email_attrs_when_email_empty():
@@ -3799,6 +4048,50 @@ def test_email_optimization_removes_email_attrs_when_email_empty():
         # since email is not empty
         assert "email" in task_with_email_serialized
         assert task_with_email_serialized["email"] == "test@example.com"
+
+
+@pytest.mark.parametrize(
+    ("allowed_types", "expected_serialized", "expected_deserialized"),
+    [
+        pytest.param(
+            [DagRunType.SCHEDULED, DagRunType.MANUAL],
+            ["manual", "scheduled"],
+            frozenset([DagRunType.SCHEDULED, DagRunType.MANUAL]),
+            id="multiple_types",
+        ),
+        pytest.param(
+            [DagRunType.SCHEDULED],
+            ["scheduled"],
+            frozenset([DagRunType.SCHEDULED]),
+            id="single_type",
+        ),
+        pytest.param(
+            None,
+            None,
+            None,
+            id="none",
+        ),
+    ],
+)
+def test_dag_allowed_run_types_serialization(allowed_types, expected_serialized, expected_deserialized):
+    """Test that allowed_run_types round-trips through serialization correctly."""
+    dag = DAG(
+        dag_id="test_allowed_run_types",
+        start_date=datetime(2023, 1, 1),
+        schedule="@daily",
+        allowed_run_types=allowed_types,
+    )
+
+    serialized = DagSerialization.to_dict(dag)
+    dag_data = serialized["dag"]
+
+    if expected_serialized is None:
+        assert dag_data.get("allowed_run_types") is None
+    else:
+        assert dag_data["allowed_run_types"] == expected_serialized
+
+    deserialized_dag = DagSerialization.from_dict(serialized)
+    assert deserialized_dag.allowed_run_types == expected_deserialized
 
 
 def dummy_callback():

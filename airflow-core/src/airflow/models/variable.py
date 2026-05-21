@@ -26,16 +26,17 @@ from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import Boolean, ForeignKey, Integer, String, Text, delete, or_, select
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
-from sqlalchemy.orm import Mapped, declared_attr, reconstructor, synonym
+from sqlalchemy.orm import Mapped, declared_attr, mapped_column, reconstructor, synonym
 
 from airflow._shared.secrets_masker import mask_secret
 from airflow.configuration import conf, ensure_secrets_loaded
 from airflow.models.base import ID_LEN, Base
 from airflow.models.crypto import get_fernet
+from airflow.sdk.exceptions import AirflowSecretsBackendAccessDenied
 from airflow.secrets.metastore import MetastoreBackend
 from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.utils.session import NEW_SESSION, create_session, provide_session
-from airflow.utils.sqlalchemy import get_dialect_name, mapped_column
+from airflow.utils.sqlalchemy import get_dialect_name
 
 if TYPE_CHECKING:
     from sqlalchemy.dialects.mysql.dml import Insert as MySQLInsert
@@ -44,6 +45,33 @@ if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
 log = logging.getLogger(__name__)
+
+
+def _build_variable_upsert_stmt(
+    dialect: str | None,
+    model: type[Variable],
+    conflict_cols: list[str],
+    values: dict[str, Any],
+    update_fields: dict[str, Any],
+) -> MySQLInsert | PostgreSQLInsert | SQLiteInsert:
+    """Return a dialect-specific INSERT ... ON CONFLICT UPDATE statement."""
+    stmt: MySQLInsert | PostgreSQLInsert | SQLiteInsert
+    if dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        stmt = pg_insert(model).values(**values)
+        stmt = stmt.on_conflict_do_update(index_elements=conflict_cols, set_=update_fields)
+    elif dialect == "mysql":
+        from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+        stmt = mysql_insert(model).values(**values)
+        stmt = stmt.on_duplicate_key_update(**update_fields)
+    else:
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        stmt = sqlite_insert(model).values(**values)
+        stmt = stmt.on_conflict_do_update(index_elements=conflict_cols, set_=update_fields)
+    return stmt
 
 
 class Variable(Base, LoggingMixin):
@@ -179,7 +207,7 @@ class Variable(Base, LoggingMixin):
         if var_val is None:
             if default_var is not cls.__NO_DEFAULT_SENTINEL:
                 return default_var
-            raise KeyError(f"Variable {key} does not exist")
+            raise KeyError(f"Variable {key} does not exist.")
         if deserialize_json:
             obj = json.loads(var_val)
             mask_secret(obj, key)
@@ -257,70 +285,27 @@ class Variable(Base, LoggingMixin):
             val = new_variable._val
             is_encrypted = new_variable.is_encrypted
 
-            # Create dialect-specific upsert statement
-            dialect_name = get_dialect_name(session)
-            stmt: MySQLInsert | PostgreSQLInsert | SQLiteInsert
-
-            if dialect_name == "postgresql":
-                from sqlalchemy.dialects.postgresql import insert as pg_insert
-
-                pg_stmt = pg_insert(Variable).values(
-                    key=key,
-                    val=val,
-                    description=description,
-                    is_encrypted=is_encrypted,
-                    team_name=team_name,
-                )
-                stmt = pg_stmt.on_conflict_do_update(
-                    index_elements=["key"],
-                    set_=dict(
-                        val=val,
-                        description=description,
-                        is_encrypted=is_encrypted,
-                        team_name=team_name,
-                    ),
-                )
-            elif dialect_name == "mysql":
-                from sqlalchemy.dialects.mysql import insert as mysql_insert
-
-                mysql_stmt = mysql_insert(Variable).values(
-                    key=key,
-                    val=val,
-                    description=description,
-                    is_encrypted=is_encrypted,
-                    team_name=team_name,
-                )
-                stmt = mysql_stmt.on_duplicate_key_update(
-                    val=val,
-                    description=description,
-                    is_encrypted=is_encrypted,
-                    team_name=team_name,
-                )
-            else:
-                from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-
-                sqlite_stmt = sqlite_insert(Variable).values(
-                    key=key,
-                    val=val,
-                    description=description,
-                    is_encrypted=is_encrypted,
-                    team_name=team_name,
-                )
-                stmt = sqlite_stmt.on_conflict_do_update(
-                    index_elements=["key"],
-                    set_=dict(
-                        val=val,
-                        description=description,
-                        is_encrypted=is_encrypted,
-                        team_name=team_name,
-                    ),
-                )
-
+            upsert_values = dict(
+                key=key,
+                val=val,
+                description=description,
+                is_encrypted=is_encrypted,
+                team_name=team_name,
+            )
+            update_fields = dict(
+                val=val,
+                description=description,
+                is_encrypted=is_encrypted,
+                team_name=team_name,
+            )
+            stmt = _build_variable_upsert_stmt(
+                get_dialect_name(session), Variable, ["key"], upsert_values, update_fields
+            )
             session.execute(stmt)
             # invalidate key in cache for faster propagation
             # we cannot save the value set because it's possible that it's shadowed by a custom backend
             # (see call to check_for_write_conflict above)
-            SecretCache.invalidate_variable(key)
+            SecretCache.invalidate_variable(key, team_name=team_name)
 
     @staticmethod
     def update(
@@ -392,6 +377,7 @@ class Variable(Base, LoggingMixin):
                 value=value,
                 description=obj.description,
                 serialize_json=serialize_json,
+                team_name=team_name,
                 session=session,
             )
 
@@ -444,7 +430,7 @@ class Variable(Base, LoggingMixin):
                 )
             )
             rows = getattr(result, "rowcount", 0) or 0
-            SecretCache.invalidate_variable(key)
+            SecretCache.invalidate_variable(key, team_name=team_name)
             return rows
 
     def rotate_fernet_key(self):
@@ -479,14 +465,14 @@ class Variable(Base, LoggingMixin):
                             _backend_name,
                             _backend_name,
                         )
-                        return
+                        return None
                 except Exception:
                     log.exception(
                         "Unable to retrieve variable from secrets backend (%s). "
                         "Checking subsequent secrets backend.",
                         type(secrets_backend).__name__,
                     )
-            return None
+        return None
 
     @staticmethod
     def get_variable_from_secrets(key: str, team_name: str | None = None) -> str | None:
@@ -499,14 +485,12 @@ class Variable(Base, LoggingMixin):
         """
         from airflow.sdk import SecretCache
 
-        # Disable cache if the variable belongs to a team. We might enable it later
-        if not team_name:
-            # check cache first
-            # enabled only if SecretCache.init() has been called first
-            try:
-                return SecretCache.get_variable(key)
-            except SecretCache.NotPresentException:
-                pass  # continue business
+        # check cache first
+        # enabled only if SecretCache.init() has been called first
+        try:
+            return SecretCache.get_variable(key, team_name=team_name)
+        except SecretCache.NotPresentException:
+            pass  # continue business
 
         var_val = None
         # iterate over backends if not in cache (or expired)
@@ -515,6 +499,9 @@ class Variable(Base, LoggingMixin):
                 var_val = secrets_backend.get_variable(key=key, team_name=team_name)
                 if var_val is not None:
                     break
+            except AirflowSecretsBackendAccessDenied:
+                # Authoritative deny — must NOT fall through to a less-restrictive backend.
+                raise
             except Exception:
                 log.exception(
                     "Unable to retrieve variable from secrets backend (%s). "
@@ -522,7 +509,7 @@ class Variable(Base, LoggingMixin):
                     type(secrets_backend).__name__,
                 )
 
-        SecretCache.save_variable(key, var_val)  # we save None as well
+        SecretCache.save_variable(key, var_val, team_name=team_name)  # we save None as well
         return var_val
 
     @staticmethod

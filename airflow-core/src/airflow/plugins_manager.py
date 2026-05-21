@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 from airflow import settings
 from airflow._shared.module_loading import import_string, qualname
 from airflow._shared.plugins_manager import (
-    AirflowPlugin,
+    AirflowPlugin as AirflowPlugin,
     AirflowPluginSource as AirflowPluginSource,
     PluginsDirectorySource as PluginsDirectorySource,
     _load_entrypoint_plugins,
@@ -38,8 +38,9 @@ from airflow._shared.plugins_manager import (
 from airflow.configuration import conf
 
 if TYPE_CHECKING:
-    from airflow.lineage.hook import HookLineageReader
     from airflow.listeners.listener import ListenerManager
+    from airflow.models.deadline import DeadlineReferenceType
+    from airflow.partition_mappers.base import PartitionMapper
     from airflow.task.priority_strategy import PriorityWeightStrategy
     from airflow.timetables.base import Timetable
 
@@ -85,7 +86,7 @@ def _get_plugins() -> tuple[list[AirflowPlugin], dict[str, str]]:
 
     Plugins are only loaded if they have not been previously loaded.
     """
-    from airflow._shared.observability.metrics.stats import Stats
+    from airflow._shared.observability.metrics import stats
 
     if not settings.PLUGINS_FOLDER:
         raise ValueError("Plugins folder is not set")
@@ -99,7 +100,11 @@ def _get_plugins() -> tuple[list[AirflowPlugin], dict[str, str]]:
     def __register_plugins(plugin_instances: list[AirflowPlugin], errors: dict[str, str]) -> None:
         for plugin_instance in plugin_instances:
             if plugin_instance.name in loaded_plugins:
-                return
+                message = f"Plugin {plugin_instance.name!r} already registered, skipping"
+                log.warning(message)
+                name = str(plugin_instance.source) if plugin_instance.source else plugin_instance.name or ""
+                import_errors[name] = message
+                continue
 
             loaded_plugins.add(plugin_instance.name)
             try:
@@ -111,7 +116,7 @@ def _get_plugins() -> tuple[list[AirflowPlugin], dict[str, str]]:
                 import_errors[name] = str(e)
         import_errors.update(errors)
 
-    with Stats.timer() as timer:
+    with stats.timer() as timer:
         load_examples = conf.getboolean("core", "LOAD_EXAMPLES")
         ignore_file_syntax = conf.get_mandatory_value("core", "DAG_IGNORE_FILE_SYNTAX", fallback="glob")
         __register_plugins(
@@ -127,7 +132,7 @@ def _get_plugins() -> tuple[list[AirflowPlugin], dict[str, str]]:
         if not settings.LAZY_LOAD_PROVIDERS:
             __register_plugins(*_load_providers_plugins())
 
-    log.debug("Loading %d plugin(s) took %.2f seconds", len(plugins), timer.duration)
+    log.debug("Loading %d plugin(s) took %.2f ms", len(plugins), timer.duration)
     return plugins, import_errors
 
 
@@ -271,14 +276,27 @@ def get_timetables_plugins() -> dict[str, type[Timetable]]:
 
 
 @cache
-def get_hook_lineage_readers_plugins() -> list[type[HookLineageReader]]:
-    """Collect and get hook lineage reader classes registered by plugins."""
-    log.debug("Initialize hook lineage readers plugins")
-    result: list[type[HookLineageReader]] = []
+def get_partition_mapper_plugins() -> dict[str, type[PartitionMapper]]:
+    """Collect and get partition mapper classes registered by plugins."""
+    log.debug("Initialize extra partition mapper plugins")
 
-    for plugin in _get_plugins()[0]:
-        result.extend(plugin.hook_lineage_readers)
-    return result
+    return {
+        qualname(partition_mapper_cls): partition_mapper_cls
+        for plugin in _get_plugins()[0]
+        for partition_mapper_cls in plugin.partition_mappers
+    }
+
+
+@cache
+def get_deadline_references_plugins() -> dict[str, type[DeadlineReferenceType]]:
+    """Collect and get deadline reference classes registered by plugins."""
+    log.debug("Initialize extra deadline reference plugins")
+
+    return {
+        qualname(deadline_ref_cls): deadline_ref_cls
+        for plugin in _get_plugins()[0]
+        for deadline_ref_cls in plugin.deadline_references
+    }
 
 
 @cache

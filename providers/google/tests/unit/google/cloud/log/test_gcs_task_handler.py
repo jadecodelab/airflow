@@ -33,7 +33,7 @@ from airflow.utils.timezone import datetime
 
 from tests_common.test_utils.config import conf_vars
 from tests_common.test_utils.db import clear_db_dags, clear_db_runs
-from tests_common.test_utils.version_compat import AIRFLOW_V_3_0_PLUS
+from tests_common.test_utils.version_compat import AIRFLOW_V_3_0_PLUS, AIRFLOW_V_3_2_2_PLUS
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -369,7 +369,14 @@ class TestGCSTaskHandler:
 
         mock_blob.from_string.assert_called_once_with(expected_gs_uri, mock_client.return_value)
 
-        if AIRFLOW_V_3_0_PLUS:
+        if AIRFLOW_V_3_2_2_PLUS:
+            logs = list(logs)
+            assert logs[0].event == "::group::Log message source details"
+            assert logs[1].event == expected_gs_uri
+            assert logs[2].event == "::endgroup::"
+            assert logs[3].event == "CONTENT"
+            assert metadata == {"end_of_log": True, "log_pos": 1}
+        elif AIRFLOW_V_3_0_PLUS:
             logs = list(logs)
             assert logs[0].event == "::group::Log message source details"
             assert logs[0].sources == [expected_gs_uri]
@@ -381,6 +388,8 @@ class TestGCSTaskHandler:
             assert logs.endswith("CONTENT")
             assert metadata == {"end_of_log": True, "log_pos": 7}
 
+    # TODO: Remove when we stop testing for 2.11 compatibility
+    @conf_vars({("core", "use_historical_filename_templates"): "True"})
     @mock.patch(
         "airflow.providers.google.cloud.log.gcs_task_handler.get_credentials_and_project_id",
         return_value=("TEST_CREDENTIALS", "TEST_PROJECT_ID"),
@@ -398,7 +407,14 @@ class TestGCSTaskHandler:
         log, metadata = self.gcs_task_handler._read(ti, self.ti.try_number)
         expected_gs_uri = f"gs://bucket/{blob_name}"
 
-        if AIRFLOW_V_3_0_PLUS:
+        if AIRFLOW_V_3_2_2_PLUS:
+            log = list(log)
+            assert log[0].event == "::group::Log message source details"
+            assert log[1].event == expected_gs_uri
+            assert log[2].event == f"{self.gcs_task_handler.local_base}/1.log"
+            assert log[3].event == "::endgroup::"
+            assert metadata == {"end_of_log": True, "log_pos": 0}
+        elif AIRFLOW_V_3_0_PLUS:
             log = list(log)
             assert log[0].event == "::group::Log message source details"
             assert log[0].sources == [
@@ -418,6 +434,8 @@ class TestGCSTaskHandler:
             assert metadata == {"end_of_log": True, "log_pos": 0}
         mock_blob.from_string.assert_called_once_with(expected_gs_uri, mock_client.return_value)
 
+    # TODO: Remove when we stop testing for 2.11 compatibility
+    @conf_vars({("core", "use_historical_filename_templates"): "True"})
     @mock.patch(
         "airflow.providers.google.cloud.log.gcs_task_handler.get_credentials_and_project_id",
         return_value=("TEST_CREDENTIALS", "TEST_PROJECT_ID"),
@@ -453,6 +471,8 @@ class TestGCSTaskHandler:
         mock_blob.from_string.return_value.upload_from_string(data="CONTENT\nMESSAGE\n")
         assert self.gcs_task_handler.closed is True
 
+    # TODO: Remove when we stop testing for 2.11 compatibility
+    @conf_vars({("core", "use_historical_filename_templates"): "True"})
     @mock.patch(
         "airflow.providers.google.cloud.log.gcs_task_handler.get_credentials_and_project_id",
         return_value=("TEST_CREDENTIALS", "TEST_PROJECT_ID"),
@@ -495,6 +515,8 @@ class TestGCSTaskHandler:
             any_order=False,
         )
 
+    # TODO: Remove when we stop testing for 2.11 compatibility
+    @conf_vars({("core", "use_historical_filename_templates"): "True"})
     @mock.patch(
         "airflow.providers.google.cloud.log.gcs_task_handler.get_credentials_and_project_id",
         return_value=("TEST_CREDENTIALS", "TEST_PROJECT_ID"),
